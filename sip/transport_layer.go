@@ -340,7 +340,12 @@ func (l *TransportLayer) ClientRequestConnection(ctx context.Context, req *Reque
 
 	// Always check does connection exists if full IP:port provided
 	// This is probably client forcing host:port
-	if laddr.IP != nil && laddr.Port > 0 {
+	if req.Method == CANCEL && raddr.IP != nil && raddr.Port > 0 {
+		c, _ = transport.GetConnection(raddr.String())
+		if c != nil {
+			return c, nil
+		}
+	} else if laddr.IP != nil && laddr.Port > 0 {
 		c, _ = transport.GetConnection(laddr.String())
 		if c != nil {
 			return c, nil
@@ -468,8 +473,15 @@ func (l *TransportLayer) resolveAddrIP(ctx context.Context, hostname string, add
 		return fmt.Errorf("lookup ip addr did not return any ip addr")
 	}
 
-	addr.IP = ips[0].IP
-	return nil
+	for _, ip := range ips {
+		trial := net.ParseIP(ip.String())
+		if trial.To4() != nil {
+			addr.IP = ip.IP
+			return nil
+		}
+	}
+
+	return errors.New("Missing IPv4 Address for host -> " + hostname)
 }
 
 func (l *TransportLayer) resolveAddrSRV(ctx context.Context, network string, hostname string, addr *Addr) error {
