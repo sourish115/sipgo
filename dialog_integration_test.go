@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/emiago/sipgo/sip"
 	"github.com/icholy/digest"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -30,7 +32,7 @@ func TestIntegrationDialog(t *testing.T) {
 		Address: sip.Uri{User: "test", Host: "127.0.0.200", Port: 5099},
 	}
 
-	dialogSrv := NewDialogServer(cli, uasContact)
+	dialogSrv := NewDialogServerCache(cli, uasContact)
 	// digestChal := digest.Challenge{
 	// 	Username: "alice",
 	// 	Password: "alice123",
@@ -68,19 +70,26 @@ func TestIntegrationDialog(t *testing.T) {
 		err = dlg.Respond(sip.StatusOK, "OK", nil)
 		require.NoError(t, err)
 
-		// ctx, _ := context.WithTimeout(ctx, 3*time.Second)
-		for state := range dlg.StateRead() {
-			if state == sip.DialogStateEnded {
-				return
-			}
-
-			if state == sip.DialogStateConfirmed {
-				time.Sleep(1 * time.Second)
-				ctx, _ := context.WithTimeout(context.Background(), 5*time.Second)
-				dlg.Bye(ctx)
-				return
-			}
+		state := dlg.LoadState()
+		if state == sip.DialogStateEnded {
+			return
 		}
+
+		time.Sleep(1 * time.Second)
+		ctx, _ := context.WithTimeout(context.Background(), 5*time.Second)
+		dlg.Bye(ctx)
+
+		// ctx, _ := context.WithTimeout(ctx, 3*time.Second)
+		// for state := range dlg.StateRead() {
+		// 	if state == sip.DialogStateEnded {
+		// 		return
+		// 	}
+
+		// 	time.Sleep(1 * time.Second)
+		// 	ctx, _ := context.WithTimeout(context.Background(), 5*time.Second)
+		// 	dlg.Bye(ctx)
+		// 	return
+		// }
 	})
 
 	srv.OnAck(func(req *sip.Request, tx sip.ServerTransaction) {
@@ -104,7 +113,7 @@ func TestIntegrationDialog(t *testing.T) {
 		}
 	})
 
-	srv.ServeRequest(func(r *sip.Request) {
+	srv.serveRequest(func(r *sip.Request) {
 		t.Log("UAS server: ", r.StartLine())
 	})
 
@@ -116,24 +125,22 @@ func TestIntegrationDialog(t *testing.T) {
 		defer ua.Close()
 
 		srv, _ := NewServer(ua)
-		cli, _ := NewClient(ua)
+		cli, _ := NewClient(ua, WithClientConnectionAddr("127.0.0.200:0"))
 
-		contactHDR := sip.ContactHeader{
-			Address: sip.Uri{User: "test", Host: "127.0.0.200", Port: 5088},
-		}
-		dialogCli := NewDialogClient(cli, contactHDR)
+		// Use for now empheral contact based on client connection
+		contactHDR := sip.ContactHeader{}
+		dialogCli := NewDialogClientCache(cli, contactHDR)
 
 		// Setup server side
 		srv.OnBye(func(req *sip.Request, tx sip.ServerTransaction) {
 			err := dialogCli.ReadBye(req, tx)
 			require.NoError(t, err)
 		})
-		srv.ServeRequest(func(r *sip.Request) {
+		srv.serveRequest(func(r *sip.Request) {
 			t.Log("UAC server: ", r.StartLine())
 		})
 
-		startTestServer(ctx, srv, contactHDR.Address.HostPort())
-		t.Run("UAS hangup", func(t *testing.T) {
+		t.Run("UAShangup", func(t *testing.T) {
 			// INVITE
 			t.Log("UAC: INVITE")
 			sess, err := dialogCli.Invite(context.TODO(), uasContact.Address, nil)
@@ -204,7 +211,7 @@ func TestIntegrationDialogBrokenUAC(t *testing.T) {
 		Address: sip.Uri{User: "test", Host: "127.0.0.201", Port: 5099},
 	}
 
-	dialogSrv := NewDialogServer(cli, uasContact)
+	dialogSrv := NewDialogServerCache(cli, uasContact)
 
 	srv.OnInvite(func(req *sip.Request, tx sip.ServerTransaction) {
 		dlg, err := dialogSrv.ReadInvite(req, tx)
@@ -212,14 +219,20 @@ func TestIntegrationDialogBrokenUAC(t *testing.T) {
 		// defer dlg.Close()
 
 		err = dlg.Respond(sip.StatusTrying, "Trying", nil)
-		require.Nil(t, err)
-
+		if err != nil {
+			fmt.Println("Error OnInvite", err)
+			return
+		}
 		err = dlg.Respond(sip.StatusRinging, "Ringing", nil)
-		require.Nil(t, err)
-
+		if err != nil {
+			fmt.Println("Error OnInvite", err)
+			return
+		}
 		err = dlg.Respond(sip.StatusOK, "OK", nil)
-		require.Nil(t, err)
-
+		if err != nil {
+			fmt.Println("Error OnInvite", err)
+			return
+		}
 		<-dlg.Context().Done()
 	})
 
@@ -227,7 +240,7 @@ func TestIntegrationDialogBrokenUAC(t *testing.T) {
 		dialogSrv.ReadAck(req, tx)
 	})
 
-	srv.ServeRequest(func(r *sip.Request) {
+	srv.serveRequest(func(r *sip.Request) {
 		t.Log("UAS server: ", r.StartLine())
 	})
 
@@ -244,14 +257,14 @@ func TestIntegrationDialogBrokenUAC(t *testing.T) {
 		contactHDR := sip.ContactHeader{
 			Address: sip.Uri{User: "test", Host: "127.0.0.201", Port: 5088},
 		}
-		dialogCli := NewDialogClient(cli, contactHDR)
+		dialogCli := NewDialogClientCache(cli, contactHDR)
 
 		// Setup server side
 		srv.OnBye(func(req *sip.Request, tx sip.ServerTransaction) {
 			err := dialogCli.ReadBye(req, tx)
 			require.NoError(t, err)
 		})
-		srv.ServeRequest(func(r *sip.Request) {
+		srv.serveRequest(func(r *sip.Request) {
 			t.Log("UAC server: ", r.StartLine())
 		})
 
@@ -295,7 +308,7 @@ func TestIntegrationDialogBrokenUAC(t *testing.T) {
 
 			// ACK
 			t.Log("UAC: ACK")
-			sess.InviteRequest.SetDestination("nodestination.dst")
+			sess.InviteResponse.Contact().Address.Host = "nodestination.dst"
 			ctx, _ := context.WithTimeout(context.Background(), 1*time.Millisecond)
 			err = sess.Ack(ctx)
 			require.Error(t, err)
@@ -306,6 +319,92 @@ func TestIntegrationDialogBrokenUAC(t *testing.T) {
 
 	}
 
+}
+
+func TestIntegrationDialogCancel(t *testing.T) {
+	if os.Getenv("TEST_INTEGRATION") == "" {
+		t.Skip("Use TEST_INTEGRATION env value to run this test")
+		return
+	}
+
+	ua, _ := NewUA()
+	defer ua.Close()
+	srv, _ := NewServer(ua)
+	cli, _ := NewClient(ua)
+	// sip.SetTimers(10*time.Millisecond, 10*time.Millisecond, 10*time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	uasContact := sip.ContactHeader{
+		Address: sip.Uri{User: "test", Host: "127.0.0.200", Port: 5099},
+	}
+
+	dialogSrv := NewDialogServerCache(cli, uasContact)
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	srv.OnInvite(func(req *sip.Request, tx sip.ServerTransaction) {
+		defer wg.Done()
+		dlg, err := dialogSrv.ReadInvite(req, tx)
+		require.NoError(t, err)
+
+		err = dlg.Respond(sip.StatusTrying, "Trying", nil)
+		require.NoError(t, err)
+
+		err = dlg.Respond(sip.StatusRinging, "Ringing", nil)
+		require.NoError(t, err)
+
+		<-dlg.Context().Done()
+	})
+
+	srv.OnCancel(func(req *sip.Request, tx sip.ServerTransaction) {
+		fmt.Println("Cancel received")
+	})
+
+	srv.serveRequest(func(r *sip.Request) {
+		fmt.Println("UAS server: ", r.StartLine())
+	})
+
+	startTestServer(ctx, srv, uasContact.Address.HostPort())
+
+	// Client
+	{
+		ua, _ := NewUA()
+		defer ua.Close()
+
+		srv, _ := NewServer(ua)
+		cli, _ := NewClient(ua)
+
+		contactHDR := sip.ContactHeader{
+			Address: sip.Uri{User: "test", Host: "127.0.0.200", Port: 5088},
+		}
+		dialogCli := NewDialogClientCache(cli, contactHDR)
+
+		srv.serveRequest(func(r *sip.Request) {
+			t.Log("UAC server: ", r.StartLine())
+		})
+
+		startTestServer(ctx, srv, contactHDR.Address.HostPort())
+
+		// INVITE
+		t.Log("UAC: INVITE")
+		sess, err := dialogCli.Invite(context.TODO(), uasContact.Address, nil)
+		require.NoError(t, err)
+		defer sess.Close()
+
+		// Cancel a call
+		ctx, cancel := context.WithCancel(sess.Context())
+		err = sess.WaitAnswer(ctx, AnswerOptions{OnResponse: func(res *sip.Response) error {
+			if res.StatusCode == sip.StatusRinging {
+				cancel()
+			}
+			return nil
+		}})
+		require.ErrorIs(t, err, context.Canceled)
+		assert.EqualValues(t, 487, sess.InviteResponse.StatusCode)
+	}
+
+	wg.Wait()
 }
 
 func startTestServer(ctx context.Context, srv *Server, hostPort string) {

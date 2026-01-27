@@ -2,10 +2,8 @@ package sip
 
 import (
 	"fmt"
-	"sync"
+	"log/slog"
 	"time"
-
-	"github.com/rs/zerolog"
 )
 
 type ClientTx struct {
@@ -18,11 +16,10 @@ type ClientTx struct {
 	timer_d      *time.Timer
 	timer_m      *time.Timer
 
-	mu        sync.RWMutex
-	closeOnce sync.Once
+	onRetransmission FnTxResponse
 }
 
-func NewClientTx(key string, origin *Request, conn Connection, logger zerolog.Logger) *ClientTx {
+func NewClientTx(key string, origin *Request, conn Connection, logger *slog.Logger) *ClientTx {
 	tx := &ClientTx{}
 	tx.key = key
 	// tx.conn = tpl
@@ -32,7 +29,7 @@ func NewClientTx(key string, origin *Request, conn Connection, logger zerolog.Lo
 	tx.done = make(chan struct{})
 	tx.log = logger
 
-	tx.origin = origin
+	tx.origin = origin // TODO:Due to subsequent request like ack we need to use clone to avoid races
 	return tx
 }
 
@@ -40,8 +37,8 @@ func (tx *ClientTx) Init() error {
 	tx.initFSM()
 
 	if err := tx.conn.WriteMsg(tx.origin); err != nil {
-		tx.log.Debug().Err(err).Str("req", tx.origin.StartLine()).Msg("Fail to write request on init")
-		return wrapTransportError(err)
+		e := fmt.Errorf("fail to write request on init req=%q: %w", tx.origin.StartLine(), err)
+		return wrapTransportError(e)
 	}
 
 	reliable := IsReliable(tx.origin.Transport())
@@ -73,7 +70,7 @@ func (tx *ClientTx) Init() error {
 		tx.spinFsmWithError(client_input_timer_b, fmt.Errorf("Timer_B timed out. %w", ErrTransactionTimeout))
 	})
 	tx.mu.Unlock()
-	tx.log.Debug().Str("tx", tx.Key()).Msg("Client transaction initialized")
+	tx.log.Debug("Client transaction initialized", "tx", tx.Key())
 	return nil
 }
 
@@ -90,11 +87,34 @@ func (tx *ClientTx) Responses() <-chan *Response {
 	return tx.responses
 }
 
-// Cancel cancels client transaction by sending CANCEL request
-func (tx *ClientTx) Cancel() error {
-	tx.spinFsm(client_input_cancel)
-	return nil
+func (tx *ClientTx) OnRetransmission(f FnTxResponse) bool {
+	tx.mu.Lock()
+	if tx.closed {
+		tx.mu.Unlock()
+		return false
+	}
+	tx.registerOnResponse(f)
+	tx.mu.Unlock()
+	return true
 }
+
+func (tx *ClientTx) registerOnResponse(f FnTxResponse) {
+	if tx.onRetransmission != nil {
+		prev := tx.onRetransmission
+		tx.onRetransmission = func(r *Response) {
+			prev(r)
+			f(r)
+		}
+		return
+	}
+	tx.onRetransmission = f
+}
+
+// Cancel cancels client transaction by sending CANCEL request
+// func (tx *ClientTx) Cancel() error {
+// 	tx.spinFsm(client_input_cancel)
+// 	return nil
+// }
 
 func (tx *ClientTx) Terminate() {
 	// select {
@@ -103,7 +123,11 @@ func (tx *ClientTx) Terminate() {
 	// default:
 	// }
 
-	tx.delete()
+	if tx.delete(ErrTransactionTerminated) {
+		tx.fsmMu.Lock()
+		tx.fsmErr = ErrTransactionCanceled
+		tx.fsmMu.Unlock()
+	}
 }
 
 // Receive will process response in safe way and change transaction state
@@ -111,38 +135,45 @@ func (tx *ClientTx) Terminate() {
 // therefore running in seperate goroutine is needed
 func (tx *ClientTx) Receive(res *Response) {
 	var input fsmInput
-	if res.IsCancel() {
-		input = client_input_canceled
-	} else {
-		switch {
-		case res.IsProvisional():
-			input = client_input_1xx
-		case res.IsSuccess():
-			input = client_input_2xx
-		default:
-			input = client_input_300_plus
-		}
+
+	// There is no more client cancelation on transaction. It must be done by caller with seperate CANCEL request
+	// and termination of current
+	// if res.IsCancel() {
+	// 	input = client_input_canceled
+	// } else {
+	switch {
+	case res.IsProvisional():
+		input = client_input_1xx
+	case res.IsSuccess():
+		input = client_input_2xx
+	default:
+		input = client_input_300_plus
 	}
+	// }
 
 	tx.spinFsmWithResponse(input, res)
 }
 
-func (tx *ClientTx) cancel() {
-	if !tx.origin.IsInvite() {
-		return
-	}
-
-	cancelRequest := newCancelRequest(tx.origin)
-	if err := tx.conn.WriteMsg(cancelRequest); err != nil {
-		tx.log.Error().
-			Str("invite_request", tx.origin.Short()).
-			Str("cancel_request", cancelRequest.Short()).
-			Msgf("send CANCEL request failed: %s", err)
-
-		err := wrapTransportError(err)
-		go tx.spinFsmWithError(client_input_transport_err, err)
-	}
+func (tx *ClientTx) Connection() Connection {
+	return tx.conn
 }
+
+// func (tx *ClientTx) cancel() {
+// 	if !tx.origin.IsInvite() {
+// 		return
+// 	}
+
+// 	cancelRequest := newCancelRequest(tx.origin)
+// 	if err := tx.conn.WriteMsg(cancelRequest); err != nil {
+// 		tx.log.Error().
+// 			Str("invite_request", tx.origin.Short()).
+// 			Str("cancel_request", cancelRequest.Short()).
+// 			Msgf("send CANCEL request failed: %s", err)
+
+// 		err := wrapTransportError(err)
+// 		go tx.spinFsmWithError(client_input_transport_err, err)
+// 	}
+// }
 
 func (tx *ClientTx) ack() {
 	resp := tx.fsmResp
@@ -151,14 +182,22 @@ func (tx *ClientTx) ack() {
 	}
 
 	ack := newAckRequestNon2xx(tx.origin, resp, nil)
+	tx.fsmAck = ack // NOTE: this could be incorect property to use but it helps preventing loops in some cases
+
+	// https://github.com/emiago/sipgo/issues/168
+	// Destination can be FQDN and we do not want to resolve this.
+	// Per https://datatracker.ietf.org/doc/html/rfc3261#section-17.1.1.2
+	// The ACK MUST be sent to the same address, port, and transport to which the original request was sent
+	// This is only needed for UDP
+	ack.SetDestination(tx.origin.Destination())
+
 	err := tx.conn.WriteMsg(ack)
 	if err != nil {
-		tx.log.Error().
-			Str("invite_request", tx.origin.Short()).
-			Str("invite_response", resp.Short()).
-			Str("cancel_request", ack.Short()).
-			Msgf("send ACK request failed: %s", err)
-
+		tx.log.Error("send ACK request failed", "tx", tx.Key(),
+			slog.String("invite_request", tx.origin.Short()),
+			slog.String("invite_response", resp.Short()),
+			slog.String("cancel_request", ack.Short()),
+		)
 		err := wrapTransportError(err)
 		go tx.spinFsmWithError(client_input_transport_err, err)
 	}
@@ -175,30 +214,23 @@ func (tx *ClientTx) resend() {
 
 	err := tx.conn.WriteMsg(tx.origin)
 	if err != nil {
-		tx.log.Debug().Err(err).Str("req", tx.origin.StartLine()).Msg("Fail to resend request")
+		tx.log.Debug("Fail to resend request", "error", err, "req", tx.origin.StartLine())
 		err := wrapTransportError(err)
 		go tx.spinFsmWithError(client_input_transport_err, err)
 	}
 }
 
-func (tx *ClientTx) delete() {
-	tx.closeOnce.Do(func() {
-		tx.mu.Lock()
-
-		close(tx.done)
-		tx.mu.Unlock()
-
-		// Maybe there is better way
-		if tx.onTerminate != nil {
-			tx.onTerminate(tx.key)
-		}
-
-		if _, err := tx.conn.TryClose(); err != nil {
-			tx.log.Info().Err(err).Msg("Closing connection returned error")
-		}
-	})
-
+func (tx *ClientTx) delete(err error) bool {
 	tx.mu.Lock()
+	if tx.closed {
+		tx.mu.Unlock()
+		return false
+	}
+	tx.closed = true
+
+	close(tx.done)
+	onterm := tx.onTerminate
+
 	if tx.timer_a != nil {
 		tx.timer_a.Stop()
 		tx.timer_a = nil
@@ -212,5 +244,14 @@ func (tx *ClientTx) delete() {
 		tx.timer_d = nil
 	}
 	tx.mu.Unlock()
-	tx.log.Debug().Str("tx", tx.Key()).Msg("Client transaction destroyed")
+	// Maybe there is better way
+	if onterm != nil {
+		tx.onTerminate(tx.key, err)
+	}
+
+	if _, err := tx.conn.TryClose(); err != nil {
+		tx.log.Info("Closing connection returned error", "error", err, "tx", tx.Key())
+	}
+	tx.log.Debug("Client transaction destroyed", "tx", tx.Key())
+	return true
 }

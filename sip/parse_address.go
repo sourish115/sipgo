@@ -36,7 +36,6 @@ func ParseAddressValue(addressText string, uri *Uri, headerParams HeaderParams) 
 // parseNameAddress
 // name-addr      =  [ display-name ] LAQUOT addr-spec RAQUOT
 // addr-spec      =  SIP-URI / SIPS-URI / absoluteURI
-// TODO Consider exporting this
 func parseNameAddress(addressText string, a *nameAddress) (err error) {
 	state := addressStateDisplayName
 	str := addressText
@@ -50,15 +49,9 @@ func parseNameAddress(addressText string, a *nameAddress) (err error) {
 }
 
 func addressStateDisplayName(a *nameAddress, s string) (addressFSM, string, error) {
-	var startQuote, endQuote int = -1, -1
 	for i, c := range s {
 		if c == '"' {
-			if startQuote < 0 {
-				startQuote = i
-			} else {
-				endQuote = i
-			}
-			continue
+			return addressStateDisplayNameQuoted, s[i+1:], nil
 		}
 
 		// https://datatracker.ietf.org/doc/html/rfc3261#section-20.10
@@ -67,18 +60,11 @@ func addressStateDisplayName(a *nameAddress, s string) (addressFSM, string, erro
 		// and ">" are present, all parameters after the URI are header
 		// parameters, not URI parameters.
 		if c == '<' {
-			if endQuote > 0 {
-				a.displayName = s[startQuote+1 : endQuote]
-			} else {
-				a.displayName = strings.TrimSpace(s[:i])
-			}
+			a.displayName = strings.TrimSpace(s[:i])
 			return addressStateUriBracket, s[i+1:], nil
 		}
 
 		if c == ';' {
-			if startQuote > 0 {
-				continue
-			}
 			// detect early
 			// uri can be without <> in that case there all after ; are header params
 			return addressStateUri, s, nil
@@ -87,6 +73,45 @@ func addressStateDisplayName(a *nameAddress, s string) (addressFSM, string, erro
 
 	// No DisplayName found
 	return addressStateUri, s, nil
+}
+
+func addressStateDisplayNameQuoted(a *nameAddress, s string) (addressFSM, string, error) {
+	var escaped bool
+	for i, c := range s {
+		if c == '\\' {
+			// https://datatracker.ietf.org/doc/html/rfc3261#section-25.1
+			// The backslash character ("\") MAY be used as a single-character
+			// quoting mechanism only within quoted-string and comment constructs.
+			escaped = !escaped
+			continue
+		}
+
+		if escaped {
+			if c == 0xA || c == 0x0D {
+				// quoted-pair  =  "\" (%x00-09 / %x0B-0C / %x0E-7F)
+				return nil, s, fmt.Errorf("invalid display name, not allowed to escape '0x%02X' in '%s'", c, s)
+			}
+			escaped = false
+			continue
+		}
+
+		if c == '"' {
+			a.displayName = s[:i]
+			s = s[i+1:]
+			for i, c := range s {
+				if c == '<' {
+					return addressStateUriBracket, s[i+1:], nil
+				}
+
+				if c == ';' {
+					return addressStateUri, s[i+1:], nil
+				}
+			}
+			return nil, s, fmt.Errorf("no uri after display name")
+		}
+	}
+
+	return nil, s, fmt.Errorf("invalid uri display name inside quotes")
 }
 
 func addressStateUriBracket(a *nameAddress, s string) (addressFSM, string, error) {
@@ -127,7 +152,9 @@ func addressStateHeaderParams(a *nameAddress, s string) (addressFSM, string, err
 		if equal > 0 {
 			name := s[:equal]
 			val := s[equal+1:]
-			a.headerParams.Add(name, val)
+			if a.headerParams != nil {
+				a.headerParams.Add(name, val)
+			}
 			return
 		}
 
@@ -138,7 +165,9 @@ func addressStateHeaderParams(a *nameAddress, s string) (addressFSM, string, err
 
 		// Case when we have key name but not value. ex ;+siptag;
 		name := s[:]
-		a.headerParams.Add(name, "")
+		if a.headerParams != nil {
+			a.headerParams.Add(name, "")
+		}
 	}
 
 	equal := -1
@@ -159,7 +188,7 @@ func addressStateHeaderParams(a *nameAddress, s string) (addressFSM, string, err
 }
 
 // headerParserTo generates ToHeader
-func headerParserTo(headerName string, headerText string) (header Header, err error) {
+func headerParserTo(headerName []byte, headerText string) (header Header, err error) {
 	h := &ToHeader{}
 	return h, parseToHeader(headerText, h)
 }
@@ -185,7 +214,7 @@ func parseToHeader(headerText string, h *ToHeader) error {
 }
 
 // headerParserFrom generates FromHeader
-func headerParserFrom(headerName string, headerText string) (header Header, err error) {
+func headerParserFrom(headerName []byte, headerText string) (header Header, err error) {
 	h := &FromHeader{}
 	return h, parseFromHeader(headerText, h)
 }
@@ -211,7 +240,7 @@ func parseFromHeader(headerText string, h *FromHeader) error {
 	return nil
 }
 
-func headerParserContact(headerName string, headerText string) (header Header, err error) {
+func headerParserContact(headerName []byte, headerText string) (header Header, err error) {
 	h := ContactHeader{}
 	return &h, parseContactHeader(headerText, &h)
 }
@@ -256,7 +285,7 @@ func parseContactHeader(headerText string, h *ContactHeader) error {
 	return err
 }
 
-func headerParserRoute(headerName string, headerText string) (header Header, err error) {
+func headerParserRoute(headerName []byte, headerText string) (header Header, err error) {
 	// Append a comma to simplify the parsing code; we split address sections
 	// on commas, so use a comma to signify the end of the final address section.
 	h := RouteHeader{}
@@ -269,7 +298,7 @@ func parseRouteHeader(headerText string, h *RouteHeader) error {
 }
 
 // parseRouteHeader generates RecordRouteHeader
-func headerParserRecordRoute(headerName string, headerText string) (header Header, err error) {
+func headerParserRecordRoute(headerName []byte, headerText string) (header Header, err error) {
 	// Append a comma to simplify the parsing code; we split address sections
 	// on commas, so use a comma to signify the end of the final address section.
 	h := RecordRouteHeader{}
@@ -278,6 +307,40 @@ func headerParserRecordRoute(headerName string, headerText string) (header Heade
 
 func parseRecordRouteHeader(headerText string, h *RecordRouteHeader) error {
 	return parseRouteAddress(headerText, &h.Address)
+}
+
+func headerParserReferTo(headerName []byte, headerText string) (header Header, err error) {
+	h := ReferToHeader{}
+	return &h, parseReferToHeader(headerText, &h)
+}
+
+func parseReferToHeader(headerText string, h *ReferToHeader) error {
+	return parseRouteAddress(headerText, &h.Address) // calling parseRouteAddress because the structure is same
+}
+
+func headerParserReferredBy(headerName []byte, headerText string) (header Header, err error) {
+	h := &ReferredByHeader{}
+	return h, parseReferredByHeader(headerText, h)
+}
+
+func parseReferredByHeader(headerText string, h *ReferredByHeader) error {
+	var err error
+
+	h.Params = NewParams()
+	h.DisplayName, err = ParseAddressValue(headerText, &h.Address, h.Params)
+	if err != nil {
+		return err
+	}
+
+	if h.Address.Wildcard {
+		// The Wildcard '*' URI is only permitted in Contact headers.
+		err = fmt.Errorf(
+			"wildcard uri not permitted in to: header: %s",
+			headerText,
+		)
+		return err
+	}
+	return nil
 }
 
 func parseRouteAddress(headerText string, address *Uri) (err error) {

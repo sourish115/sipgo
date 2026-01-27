@@ -3,16 +3,13 @@ package sipgo
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"strings"
 
 	"github.com/emiago/sipgo/sip"
-
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 )
 
 var (
@@ -21,6 +18,18 @@ var (
 )
 
 type ListenReadyCtxValue chan struct{}
+type ListenReadyFuncCtxValue func(network string, addr string)
+
+func listenReadyCtx(ctx context.Context, network string, addr string) {
+	if v := ctx.Value(ListenReadyCtxKey); v != nil {
+		switch vv := v.(type) {
+		case ListenReadyCtxValue:
+			vv <- struct{}{}
+		case ListenReadyFuncCtxValue:
+			vv(network, addr)
+		}
+	}
+}
 
 // RequestHandler is a callback that will be called on the incoming request
 type RequestHandler func(req *sip.Request, tx sip.ServerTransaction)
@@ -33,16 +42,15 @@ type Server struct {
 	requestHandlers map[sip.RequestMethod]RequestHandler
 	noRouteHandler  RequestHandler
 
-	log zerolog.Logger
+	log *slog.Logger
 
-	requestMiddlewares  []func(r *sip.Request)
-	responseMiddlewares []func(r *sip.Response)
+	requestMiddlewares []func(r *sip.Request)
 }
 
 type ServerOption func(s *Server) error
 
 // WithServerLogger allows customizing server logger
-func WithServerLogger(logger zerolog.Logger) ServerOption {
+func WithServerLogger(logger *slog.Logger) ServerOption {
 	return func(s *Server) error {
 		s.log = logger
 		return nil
@@ -59,7 +67,7 @@ func NewServer(ua *UserAgent, options ...ServerOption) (*Server, error) {
 	}
 
 	// Handle our transaction layer requests
-	s.tx.OnRequest(s.onRequest)
+	s.tx.OnRequest(s.handleRequest)
 	return s, nil
 }
 
@@ -68,10 +76,10 @@ func newBaseServer(ua *UserAgent, options ...ServerOption) (*Server, error) {
 		UserAgent: ua,
 		// userAgent:           "SIPGO",
 		// dnsResolver:         net.DefaultResolver,
-		requestMiddlewares:  make([]func(r *sip.Request), 0),
-		responseMiddlewares: make([]func(r *sip.Response), 0),
-		requestHandlers:     make(map[sip.RequestMethod]RequestHandler),
-		log:                 log.Logger.With().Str("caller", "Server").Logger(),
+		requestMiddlewares: make([]func(r *sip.Request), 0),
+		requestHandlers:    make(map[sip.RequestMethod]RequestHandler),
+		// log:                 log.Logger.With().Str("caller", "Server").Logger(),
+		log: sip.DefaultLogger().With("caller", "Server"),
 	}
 	for _, o := range options {
 		if err := o(s); err != nil {
@@ -79,7 +87,6 @@ func newBaseServer(ua *UserAgent, options ...ServerOption) (*Server, error) {
 		}
 	}
 
-	// TODO have this exported as option
 	s.noRouteHandler = s.defaultUnhandledHandler
 
 	return s, nil
@@ -99,14 +106,14 @@ func (srv *Server) ListenAndServe(ctx context.Context, network string, addr stri
 				return
 			}
 			if err := connCloser.Close(); err != nil {
-				srv.log.Error().Err(err).Msg("Failed to close listener")
+				srv.log.Error("Failed to close listener", "error", err)
 			}
 
 		}
 	}()
 
 	switch network {
-	case "udp", "udp4":
+	case "udp", "udp4", "udp6":
 		// resolve local UDP endpoint
 		laddr, err := net.ResolveUDPAddr(network, addr)
 		if err != nil {
@@ -119,12 +126,10 @@ func (srv *Server) ListenAndServe(ctx context.Context, network string, addr stri
 		}
 
 		connCloser = udpConn
-		if v := ctx.Value(ListenReadyCtxKey); v != nil {
-			v.(ListenReadyCtxValue) <- struct{}{}
-		}
+		listenReadyCtx(ctx, network, udpConn.LocalAddr().String())
 		return srv.tp.ServeUDP(udpConn)
 
-	case "tcp", "tcp4":
+	case "tcp", "tcp4", "tcp6":
 		laddr, err := net.ResolveTCPAddr(network, addr)
 		if err != nil {
 			return fmt.Errorf("fail to resolve address. err=%w", err)
@@ -136,13 +141,12 @@ func (srv *Server) ListenAndServe(ctx context.Context, network string, addr stri
 		}
 
 		connCloser = conn
-		if v := ctx.Value(ListenReadyCtxKey); v != nil {
-			v.(ListenReadyCtxValue) <- struct{}{}
-		}
+		listenReadyCtx(ctx, network, conn.Addr().String())
 
 		return srv.tp.ServeTCP(conn)
-	case "ws":
-		network = "tcp"
+	case "ws", "ws4", "ws6":
+		ipv := network[2:]
+		network = "tcp" + ipv
 		laddr, err := net.ResolveTCPAddr(network, addr)
 		if err != nil {
 			return fmt.Errorf("fail to resolve address. err=%w", err)
@@ -154,9 +158,7 @@ func (srv *Server) ListenAndServe(ctx context.Context, network string, addr stri
 		}
 
 		connCloser = conn
-		if v := ctx.Value(ListenReadyCtxKey); v != nil {
-			v.(ListenReadyCtxValue) <- struct{}{}
-		}
+		listenReadyCtx(ctx, network, conn.Addr().String())
 		// and uses listener to buffer
 		return srv.tp.ServeWS(conn)
 	}
@@ -164,7 +166,7 @@ func (srv *Server) ListenAndServe(ctx context.Context, network string, addr stri
 }
 
 // Serve will fire all listeners that are secured.
-// Network supported: tls, wss
+// Network supported: tls, wss, tcp, tcp4, tcp6, ws, ws4, ws6
 func (srv *Server) ListenAndServeTLS(ctx context.Context, network string, addr string, conf *tls.Config) error {
 	network = strings.ToLower(network)
 
@@ -180,30 +182,44 @@ func (srv *Server) ListenAndServeTLS(ctx context.Context, network string, addr s
 				return
 			}
 			if err := connCloser.Close(); err != nil {
-				srv.log.Error().Err(err).Msg("Failed to close listener")
+				srv.log.Error("Failed to close listener", "error", err)
 			}
 
 		}
 	}()
-	// Do some filtering
+	// Support explicitp ipv4 vs ipv6
+	tcpNetwork := "tcp"
 	switch network {
-	case "tls", "tcp", "ws", "wss":
-		laddr, err := net.ResolveTCPAddr("tcp", addr)
+	case "tcp":
+		tcpNetwork = "tcp"
+		network = "tls"
+	case "ws":
+		tcpNetwork = "tcp"
+		network = "wss"
+	case "tcp4", "ws4":
+		tcpNetwork = "tcp4"
+		network = "tls"
+	case "tcp6", "ws6":
+		tcpNetwork = "tcp6"
+		network = "wss"
+	}
+
+	switch network {
+	case "tls", "wss":
+		laddr, err := net.ResolveTCPAddr(tcpNetwork, addr)
 		if err != nil {
 			return fmt.Errorf("fail to resolve address. err=%w", err)
 		}
 
-		listener, err := tls.Listen("tcp", laddr.String(), conf)
+		listener, err := tls.Listen(tcpNetwork, laddr.String(), conf)
 		if err != nil {
 			return fmt.Errorf("listen tls error. err=%w", err)
 		}
 
 		connCloser = listener
+		listenReadyCtx(ctx, network, listener.Addr().String())
 
-		if v := ctx.Value(ListenReadyCtxKey); v != nil {
-			v.(ListenReadyCtxValue) <- struct{}{} //
-		}
-		if network == "ws" || network == "wss" {
+		if network == "wss" {
 			return srv.tp.ServeWSS(listener)
 		}
 
@@ -238,15 +254,8 @@ func (srv *Server) ServeWSS(l net.Listener) error {
 	return srv.tp.ServeWSS(l)
 }
 
-// onRequest gets request from Transaction layer
-func (srv *Server) onRequest(req *sip.Request, tx sip.ServerTransaction) {
-	// Transaction layer is the one who controls concurency execution of every request
-	// so in this case we should avoid adding more concurency
-	srv.handleRequest(req, tx)
-}
-
-// handleRequest must be run in seperate goroutine
-func (srv *Server) handleRequest(req *sip.Request, tx sip.ServerTransaction) {
+// handleRequest is handling transaction layer
+func (srv *Server) handleRequest(req *sip.Request, tx *sip.ServerTx) {
 	for _, mid := range srv.requestMiddlewares {
 		mid(req)
 	}
@@ -255,7 +264,7 @@ func (srv *Server) handleRequest(req *sip.Request, tx sip.ServerTransaction) {
 	handler(req, tx)
 	if tx != nil {
 		// Must be called to prevent any transaction leaks
-		tx.Terminate()
+		tx.TerminateGracefully()
 	}
 }
 
@@ -370,56 +379,20 @@ func (srv *Server) getHandler(method sip.RequestMethod) (handler RequestHandler)
 }
 
 func (srv *Server) defaultUnhandledHandler(req *sip.Request, tx sip.ServerTransaction) {
-	srv.log.Warn().Msg("SIP request handler not found")
+	srv.log.Warn("SIP request handler not found", "method", req.Method)
 	res := sip.NewResponseFromRequest(req, 405, "Method Not Allowed", nil)
-	// Send response directly and let transaction terminate
-	if err := srv.WriteResponse(res); err != nil {
-		srv.log.Error().Err(err).Msg("respond '405 Method Not Allowed' failed")
+	if err := tx.Respond(res); err != nil {
+		srv.log.Error("respond '405 Method Not Allowed' failed", "error", err)
 	}
 }
 
-// ServeRequest can be used as middleware for preprocessing message
-func (srv *Server) ServeRequest(f func(r *sip.Request)) {
+// serveRequest can be used as middleware for preprocessing message
+func (srv *Server) serveRequest(f func(r *sip.Request)) {
 	srv.requestMiddlewares = append(srv.requestMiddlewares, f)
-}
-
-func (srv *Server) onTransportMessage(m sip.Message) {
-	//Register transport middleware
-	// this avoids allocations and it forces devs to avoid sip.Message usage
-	switch r := m.(type) {
-	case *sip.Response:
-		for _, mid := range srv.responseMiddlewares {
-			mid(r)
-		}
-	}
 }
 
 // Transport is function to get transport layer of server
 // Can be used for modifying
 func (srv *Server) TransportLayer() *sip.TransportLayer {
 	return srv.tp
-}
-
-// GenerateTLSConfig creates basic tls.Config that you can pass for ServerTLS
-// It needs rootPems for client side
-func GenerateTLSConfig(certFile string, keyFile string, rootPems []byte) (*tls.Config, error) {
-	roots := x509.NewCertPool()
-	if rootPems != nil {
-		ok := roots.AppendCertsFromPEM(rootPems)
-		if !ok {
-			return nil, fmt.Errorf("failed to parse root certificate")
-		}
-	}
-
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return nil, fmt.Errorf("fail to load cert. err=%w", err)
-	}
-
-	conf := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		RootCAs:      roots,
-	}
-
-	return conf, nil
 }

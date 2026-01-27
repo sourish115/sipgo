@@ -3,30 +3,34 @@ package sip
 import (
 	"fmt"
 	"io"
+	"net"
 	"strconv"
 	"strings"
 
-	uuid "github.com/satori/go.uuid"
+	"github.com/google/uuid"
 )
 
 // Response RFC 3261 - 7.2.
 type Response struct {
 	MessageData
 
-	Reason     string     // e.g. "200 OK"
-	StatusCode StatusCode // e.g. 200
+	Reason     string // e.g. "200 OK"
+	StatusCode int    // e.g. 200
+
+	// raddr is resolved address from request
+	raddr Addr
 }
 
 // NewResponse creates base structure of response.
 func NewResponse(
-	statusCode StatusCode,
+	statusCode int,
 	reason string,
 ) *Response {
 	res := &Response{}
 	res.SipVersion = "SIP/2.0"
 	res.headers = headers{
 		// headers:     make(map[string]Header),
-		headerOrder: make([]Header, 0),
+		headerOrder: make([]Header, 0, 10),
 	}
 	res.StatusCode = statusCode
 	res.Reason = reason
@@ -191,7 +195,7 @@ func (res *Response) Destination() string {
 // RFC 3261 - 8.2.6
 func NewResponseFromRequest(
 	req *Request,
-	statusCode StatusCode,
+	statusCode int,
 	reason string,
 	body []byte,
 ) *Response {
@@ -218,6 +222,15 @@ func NewResponseFromRequest(
 		res.AppendHeader(h.headerClone())
 	}
 
+	if h := res.Via(); h != nil {
+		// https://datatracker.ietf.org/doc/html/rfc3581#section-4
+		if val, exists := h.Params.Get("rport"); exists && val == "" {
+			host, port, _ := net.SplitHostPort(req.Source())
+			h.Params.Add("rport", port)
+			h.Params.Add("received", host)
+		}
+	}
+
 	// 8.2.6.2 Headers and Tags
 	// the response (with the exception of the 100 (Trying) response, in
 	// which a tag MAY be present). This serves to identify the UAS that is
@@ -229,18 +242,35 @@ func NewResponseFromRequest(
 	case 100:
 		CopyHeaders("Timestamp", req, res)
 	default:
-		if _, ok := res.To().Params["tag"]; !ok {
-			uuid, _ := uuid.NewV4()
-			res.to.Params["tag"] = uuid.String()
+		if h := res.To(); h != nil {
+			if _, ok := h.Params["tag"]; !ok {
+				h.Params["tag"] = uuid.NewString()
+			}
 		}
 	}
 
 	res.SetBody(body)
 	res.SetTransport(req.Transport())
-	res.SetSource(req.Destination())
-	res.SetDestination(req.Source())
+
+	// If raddr is present this is resolved remote addr based on via header, otherwise use connection based source addr
+	if req.raddr.IP != nil {
+		res.SetDestination(req.raddr.String())
+	} else {
+		res.SetDestination(req.Source())
+	}
 
 	return res
+}
+
+// TODO we may want to have resolved IP destination as seperate variable like request
+func (r *Response) remoteAddress() Addr {
+	dst := r.dest
+	host, port, _ := ParseAddr(dst)
+	return Addr{
+		IP:       net.ParseIP(host),
+		Port:     port,
+		Hostname: dst,
+	}
 }
 
 // NewSDPResponseFromRequest is wrapper for 200 response with SDP body

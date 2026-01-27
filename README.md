@@ -2,28 +2,30 @@
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/emiago/sipgo)](https://goreportcard.com/report/github.com/emiago/sipgo)
 ![Used By](https://sourcegraph.com/github.com/emiago/sipgo/-/badge.svg)
-![Coverage](https://img.shields.io/badge/coverage-45.9%25-blue)
+![Coverage](https://img.shields.io/badge/coverage-55.4%25-blue)
 [![License](https://img.shields.io/badge/License-BSD_2--Clause-orange.svg)](https://github.com/emiago/sipgo/LICENCE) 
 ![GitHub go.mod Go version](https://img.shields.io/github/go-mod/go-version/emiago/sipgo)
 
 **SIPGO** is library for writing fast SIP services in GO language.  
-It comes with [SIP stack](/sip/README.md) ([RFC 3261](https://datatracker.ietf.org/doc/html/rfc3261)|[RFC3581](https://datatracker.ietf.org/doc/html/rfc3581)) optimized for fast parsing.
+It comes with [SIP stack](/sip/README.md) ([RFC 3261](https://datatracker.ietf.org/doc/html/rfc3261)|[RFC3581](https://datatracker.ietf.org/doc/html/rfc3581)|[RFC6026](https://datatracker.ietf.org/doc/html/rfc6026)) optimized for fast parsing.
 
-For extra functionality checkout also   
-- [github.com/emiago/sipgox](https://github.com/emiago/sipgox) - Extra SIP functionality like fast building SIP phone
-- [github.com/emiago/media](https://github.com/emiago/media) - Adds base functionality for real time media (*sdp, rtp, rtcp*)
+
+**Libs on top of sipgo:**
+- ***diago*** [github.com/emiago/diago](https://github.com/emiago/diago): Full VOIP library/framework with media stack 
+
+**Tools/Service:**
+- <img width="20" src="https://github.com/emiago/diagox/raw/main/images/diagox-icon-blue.png"> [github.com/emiago/diagox](https://github.com/emiago/diagox) simple Ingress/Egress and Registrar for SIP/RTP scaling
+- <img width="20" src="https://github.com/emiago/gophone/raw/main/images/g2.png"> [github.com/emiago/gophone](https://github.com/emiago/gophone) CLI softphone for easy testing 
+
 
 Fetch lib with:
 
 `go get github.com/emiago/sipgo`
 
-**NOTE**: LIB MAY HAVE API CHANGES UNTIL STABLE VERSION.
 
-*If you like/use project currently or need additional help/support checkout [Support section](#support) 
-
+If you like/use project currently and looking for support/sponsoring  checkout [Support section](#support)  
 
 You can follow on [X/Twitter](https://twitter.com/emiago123) for more updates.
-
 
 More on documentation you can find on [Go doc](https://pkg.go.dev/github.com/emiago/sipgo)
 
@@ -34,6 +36,18 @@ More on documentation you can find on [Go doc](https://pkg.go.dev/github.com/emi
 - [x] TLS
 - [x] WS
 - [x] WSS
+
+
+### RFC:
+- [RFC3261](https://datatracker.ietf.org/doc/html/rfc3261)
+- [RFC3263](https://datatracker.ietf.org/doc/html/rfc3263)
+- [RFC3581](https://datatracker.ietf.org/doc/html/rfc3581)
+- [RFC6026](https://datatracker.ietf.org/doc/html/rfc6026)
+
+State of Torture Tests [RFC4475](https://datatracker.ietf.org/doc/html/rfc6026) you can find on issue [github.com/emiago/sipgo/issues/57](https://github.com/emiago/sipgo/issues/57)
+but NOTE: some strict validation things may 
+be seperated from parsing or not built into library.
+
 
 ## Examples
 
@@ -46,26 +60,16 @@ Also thanks to [pion](https://github.com/pion/webrtc) project sharing this examp
 
 
 
-## Tools developed:
-- CLI softphone for easy testing [gophone](https://github.com/emiago/gophone)
-- Simple proxy where NAT is problem [psip](https://github.com/emiago/psip)
-- ... *your tool can be here*
 
-## Performance
+## Performance :rocket
 
-As example you can find `example/proxysip` as simple version of statefull proxy. It is used for stress testing with `sipp`. 
+SIPgo was proven that can excel in performance compared to some other configured base proxy solutions. 
+
+As an example, you can find `example/proxysip` as simple version of statefull proxy. It is used for stress testing with `sipp`. 
 To find out more about performance check the latest results:  
 [example/proxysip](example/proxysip) 
 
-## Used By
 
-<a href="https://www.babelforce.com">
-<img src="icons/babelforce-logo.png" width="300" alt="babelforce">
-</a>
-
-
----
-*If you are using in company, your logo can be here.*
 
 # Usage
 
@@ -83,7 +87,6 @@ srv, _ := sipgo.NewServer(ua) // Creating server handle for ua
 client, _ := sipgo.NewClient(ua) // Creating client handle for ua
 srv.OnInvite(inviteHandler)
 srv.OnAck(ackHandler)
-srv.OnCancel(cancelHandler)
 srv.OnBye(byeHandler)
 
 // For registrars
@@ -102,9 +105,31 @@ go srv.ListenAndServe(ctx, "ws", "127.0.0.1:5080")
 ### TLS transports
 ```go 
 // TLS
-conf :=  sipgo.GenerateTLSConfig(certFile, keyFile, rootPems)
+conf := generateTLSConfig(certFile, keyFile, rootPems)
 srv.ListenAndServeTLS(ctx, "tcp", "127.0.0.1:5061", conf)
 srv.ListenAndServeTLS(ctx, "ws", "127.0.0.1:5081", conf)
+
+func generateTLSConfig(certFile string, keyFile string, rootPems []byte) (*tls.Config, error) {
+	roots := x509.NewCertPool()
+	if rootPems != nil {
+		ok := roots.AppendCertsFromPEM(rootPems)
+		if !ok {
+			return nil, fmt.Errorf("failed to parse root certificate")
+		}
+	}
+
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("fail to load cert. err=%w", err)
+	}
+
+	conf := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      roots,
+	}
+
+	return conf, nil
+}
 ```
 
 ### UAC first
@@ -125,6 +150,8 @@ srv.OnBye(func(req *sip.Request, tx sip.ServerTransaction)) {
 tx, err := client.TransactionRequest(ctx, sip.NewRequest(sip.INVITE, recipient)) 
 ```
 
+
+
 ## Server Transaction
 
 Server transaction is passed on handler
@@ -132,19 +159,22 @@ Server transaction is passed on handler
 ```go
 // Incoming request
 srv.OnInvite(func(req *sip.Request, tx sip.ServerTransaction) {
-    res := sip.NewResponseFromRequest(req, code, reason, body)
-    // Send response
+    // Send provisional
+    res := sip.NewResponseFromRequest(req, 100, "Trying", nil)
+    tx.Respond(res)
+    
+    // Send OK. TODO: some body like SDP
+    res := sip.NewResponseFromRequest(req, 200, "OK", body)
     tx.Respond(res)
 
+    // Wait transaction termination.
     select {
-        case m := <-tx.Acks(): // Handle ACK . ACKs on 2xx are send as different request
-        case m := <-tx.Cancels(): // Handle Cancel 
+        case m := <-tx.Acks(): // Handle ACK for response . ACKs on 2xx are send as different request
         case <-tx.Done():
             // Signal transaction is done. 
             // Check any errors with tx.Err() to have more info why terminated
             return
     }
-
     // terminating handler terminates Server transaction automaticaly
 })
 
@@ -162,6 +192,14 @@ func ackHandler(req *sip.Request, tx sip.ServerTransaction) {
 srv.OnACK(ackHandler)
 ```
 
+## Client Do request
+
+Unless you need more control over [Client Transaction](#client-transaction) you can simply go with client `Do` request and wait final response (following std http package).
+
+```go
+req := sip.NewRequest(sip.INVITE, sip.Uri{User:"bob", Host: "example.com"})
+res, err := client.Do(req)
+```
 
 ## Client Transaction
 
@@ -174,8 +212,7 @@ Here is full example:
 ctx := context.Background()
 client, _ := sipgo.NewClient(ua) // Creating client handle
 
-// Request is either from server request handler or created
-req.SetDestination("10.1.2.3") // Change sip.Request destination
+req := sip.NewRequest(sip.INVITE, sip.Uri{User:"bob", Host: "example.com"})
 tx, err := client.TransactionRequest(ctx, req) // Send request and get client transaction handle
 
 defer tx.Terminate() // Client Transaction must be terminated for cleanup
@@ -191,29 +228,34 @@ select {
 
 ```
 
-## Client Do request
-
-Unless you need more control over [Client Transaction](#client-transaction) you can simply go with client `Do` request and wait final response.
-
-```go
-req := sip.NewRequest(sip.INVITE, sip.Uri{User:"bob", Host: "example.com"})
-res, err := client.Do(req)
-```
+#### CSEQ Header increase rule: 
+1. Every new transaction will have **implicitely** CSEQ increase if present -> [Issue 160](https://github.com/emiago/sipgo/issues/160). This fixes problem when you are passing same request like ex. REGISTER
+2. Above rule does not apply for In Dialog cases
+2. To avoid 1. pass option `client.TransactionRequest(ctx, req, sipgo.ClientRequestBuild)` or more better used `DialogClient`
 
 ## Client stateless request
 
 ```go
 client, _ := sipgo.NewClient(ua) // Creating client handle
-req := sip.NewRequest(method, recipient)
+req := sip.NewRequest(sip.ACK, sip.Uri{User:"bob", Host: "example.com"})
 // Send request and forget
 client.WriteRequest(req)
 ```
 
 ## Dialog handling
 
-`DialogClient` and `DialogServer` allow easier managing multiple dialog (Calls) sessions. 
+`DialogUA` is helper struct to create `Dialog`. 
+**Dialog** can be **as server** or **as client** created. Later on this provides you RFC way of sending request within dialog `Do` or `TransactionRequest` functions.
+
+For basic usage `DialogClientCache` and `DialogServerCache` are created to be part of library to manage and cache dialog accross multiple request.
 They are seperated based on your **request context**, but they act more like `peer`.
-They both need `client` **handle** to be able send request and `server` **handle** to accept request.
+
+---
+**NOTE**: **It is recomended that you build your OWN Dialog Server/Client Cache mechanism for dialogs.**
+
+---
+
+For basic control some handling request wrappers like `Ack`, `Bye`, `ReadAck`, `ReadBye` is provided. Sending  any other request should be done with `Do` or receiving can be validated with `ReadRequest`
 
 
 **UAC**:
@@ -225,7 +267,7 @@ client, _ := sipgo.NewClient(ua) // Creating client handle
 contactHDR := sip.ContactHeader{
     Address: sip.Uri{User: "test", Host: "127.0.0.200", Port: 5088},
 }
-dialogCli := sipgo.NewDialogClient(client, contactHDR)
+dialogCli := sipgo.NewDialogClientCache(client, contactHDR)
 
 // Attach Bye handling for dialog
 srv.OnBye(func(req *sip.Request, tx sip.ServerTransaction) {
@@ -253,10 +295,14 @@ client, _ := sipgo.NewClient(ua) // Creating client handle
 uasContact := sip.ContactHeader{
     Address: sip.Uri{User: "test", Host: "127.0.0.200", Port: 5099},
 }
-dialogSrv := sipgo.NewDialogServer(client, uasContact)
+dialogSrv := sipgo.NewDialogServerCache(client, uasContact)
 
 srv.OnInvite(func(req *sip.Request, tx sip.ServerTransaction) {
     dlg, err := dialogSrv.ReadInvite(req, tx)
+    if err != nil {
+        return err
+    }
+    defer dlg.Close() // Close for cleanup from cache
     // handle error
     dlg.Respond(sip.StatusTrying, "Trying", nil)
     dlg.Respond(sip.StatusOK, "OK", nil)
@@ -273,6 +319,16 @@ srv.OnBye(func(req *sip.Request, tx sip.ServerTransaction) {
     dialogSrv.ReadBye(req, tx)
 })
 ```
+
+### Dialog Do/Transaction request
+
+For any other request within dialog you should use `dialog.Do` to send request. Requests withing dialog need more 
+checks to pass and therefore this API helps to keep requests within dialog session.
+```go
+req := sip.NewRequest(sip.INFO, recipient)
+res, err := dialog.Do(ctx, req)
+```
+
 
 ## Stateful Proxy build
 
@@ -322,10 +378,9 @@ Content-Length:  0
 ## Support
 
 If you find this project interesting for bigger support or consulting, you can contact me on
-[mail](emirfreelance91@gmail.com)
+[mail](mailto:emirfreelance91@gmail.com)
 
 For bugs features pls create [issue](https://github.com/emiago/sipgo/issues).
-
 
 ## Extra
 

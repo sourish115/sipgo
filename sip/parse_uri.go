@@ -14,9 +14,9 @@ type uriFSM func(uri *Uri, s string) (uriFSM, string, error)
 // sip:user:password@host:port;uri-parameters?headers
 func ParseUri(uriStr string, uri *Uri) (err error) {
 	if len(uriStr) == 0 {
-		return errors.New("Empty URI")
+		return errors.New("empty URI")
 	}
-	state := uriStateSIP
+	state := uriStateScheme
 	str := uriStr
 	for state != nil {
 		state, str, err = state(uri, str)
@@ -27,37 +27,47 @@ func ParseUri(uriStr string, uri *Uri) (err error) {
 	return
 }
 
-func uriStateSIP(uri *Uri, s string) (uriFSM, string, error) {
-	if len(s) >= 4 && strings.EqualFold(s[:4], "sip:") {
-		return uriStateScheme, s[4:], nil
+func uriStateScheme(uri *Uri, s string) (uriFSM, string, error) {
+	// Do fast checks. Minimum uri
+	if len(s) < 3 {
+		if s == "*" {
+			// Normally this goes under url path, but we set on host
+			uri.Host = "*"
+			uri.Wildcard = true
+			return nil, "", nil
+		}
+		return nil, "", fmt.Errorf("not valid sip uri")
 	}
 
-	if len(s) >= 5 && strings.EqualFold(s[:5], "sips:") {
-		uri.Encrypted = true
-		return uriStateScheme, s[5:], nil
+	for i, c := range s {
+		if c == ':' {
+			uri.Scheme = ASCIIToLower(s[:i])
+			return uriStateSlashes, s[i+1:], nil
+		}
+		// Check is c still ASCII
+		if !isASCII(c) {
+			return nil, "", fmt.Errorf("invalid uri scheme")
+		}
 	}
 
-	if s == "*" {
-		// Normally this goes under url path, but we set on host
-		uri.Host = "*"
-		uri.Wildcard = true
-		return nil, "", nil
-	}
-
-	// return nil, "", errors.New("missing protocol scheme")
-	return uriStateUser, s, nil
+	return nil, "", fmt.Errorf("missing protocol scheme")
 }
 
-func uriStateScheme(_ *Uri, s string) (uriFSM, string, error) {
+func uriStateSlashes(uri *Uri, s string) (uriFSM, string, error) {
 	// Check does uri contain slashes
 	// They are valid in uri but normally we cut them
-	s, _ = strings.CutPrefix(s, "//")
+	s, uri.HierarhicalSlashes = strings.CutPrefix(s, "//")
 	return uriStateUser, s, nil
 }
 
 func uriStateUser(uri *Uri, s string) (uriFSM, string, error) {
 	var userend int = 0
 	for i, c := range s {
+		if c == '[' {
+			// IPV6
+			return uriStateHost, s[i:], nil
+		}
+
 		if c == ':' {
 			userend = i
 		}
@@ -76,19 +86,12 @@ func uriStateUser(uri *Uri, s string) (uriFSM, string, error) {
 	return uriStateHost, s, nil
 }
 
-func uriStatePassword(uri *Uri, s string) (uriFSM, string, error) {
-	for i, c := range s {
-		if c == '@' {
-			uri.Password = s[:i]
-			return uriStateHost, s[i+1:], nil
-		}
-	}
-
-	return nil, "", fmt.Errorf("missing @")
-}
-
 func uriStateHost(uri *Uri, s string) (uriFSM, string, error) {
 	for i, c := range s {
+		if c == '[' {
+			return uriStateHostIPV6, s[i:], nil
+		}
+
 		if c == ':' {
 			uri.Host = s[:i]
 			return uriStatePort, s[i+1:], nil
@@ -111,6 +114,41 @@ func uriStateHost(uri *Uri, s string) (uriFSM, string, error) {
 	return uriStateUriParams, "", nil
 }
 
+func uriStateHostIPV6(uri *Uri, s string) (uriFSM, string, error) {
+	// ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff max 39 + 2 brackets
+	// Do not waste time looking end
+	maxs := min(len(s), 42)
+
+	ind := strings.Index(s[:maxs], "]")
+	if ind <= 0 {
+		return nil, s, fmt.Errorf("IPV6 no closing bracket")
+	}
+	uri.Host = s[:ind+1]
+
+	if ind+1 == len(s) {
+		// finished
+		return uriStateUriParams, "", nil
+	}
+
+	s = s[ind+1:]
+
+	// Check now termination
+	c := s[0]
+	if c == ':' {
+		return uriStatePort, s[1:], nil
+	}
+
+	if c == ';' {
+		return uriStateUriParams, s[1:], nil
+	}
+
+	if c == '?' {
+		return uriStateHeaders, s[1:], nil
+	}
+
+	return uriStateUriParams, "", nil
+}
+
 func uriStatePort(uri *Uri, s string) (uriFSM, string, error) {
 	var err error
 	for i, c := range s {
@@ -126,7 +164,7 @@ func uriStatePort(uri *Uri, s string) (uriFSM, string, error) {
 	}
 
 	uri.Port, err = strconv.Atoi(s)
-	return nil, s, err
+	return uriStateUriParams, "", err
 }
 
 func uriStateUriParams(uri *Uri, s string) (uriFSM, string, error) {
@@ -139,7 +177,7 @@ func uriStateUriParams(uri *Uri, s string) (uriFSM, string, error) {
 	}
 	uri.UriParams = NewParams()
 	// uri.UriParams, n, err = ParseParams(s, 0, ';', '?', true, true)
-	n, err = UnmarshalParams(s, ';', '?', uri.UriParams)
+	n, err = UnmarshalHeaderParams(s, ';', '?', uri.UriParams)
 	if err != nil {
 		return nil, s, err
 	}
@@ -159,6 +197,6 @@ func uriStateHeaders(uri *Uri, s string) (uriFSM, string, error) {
 	var err error
 	// uri.Headers, _, err = ParseParams(s, 0, '&', 0, true, false)
 	uri.Headers = NewParams()
-	_, err = UnmarshalParams(s, '&', 0, uri.Headers)
+	_, err = UnmarshalHeaderParams(s, '&', 0, uri.Headers)
 	return nil, s, err
 }

@@ -3,6 +3,7 @@ package sip
 import (
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -12,6 +13,11 @@ type Request struct {
 	MessageData
 	Method    RequestMethod
 	Recipient Uri
+
+	// Laddr is Connection local Addr used to sent request
+	Laddr Addr
+	// raddr is address set after resolving Via
+	raddr Addr
 }
 
 // NewRequest creates base for building sip Request
@@ -31,8 +37,7 @@ func NewRequest(method RequestMethod, recipient Uri) *Request {
 	req.SipVersion = "SIP/2.0"
 	// req.headers = newHeaders()
 	req.headers = headers{
-		// headers:     make(map[string]Header),
-		headerOrder: make([]Header, 0),
+		headerOrder: make([]Header, 0, 10), // making capacity allows faster appending headers
 	}
 	req.Method = method
 	req.Recipient = recipient
@@ -93,6 +98,8 @@ func (req *Request) StringWrite(buffer io.StringWriter) {
 	// buffer.WriteString("\r\n")
 }
 
+// Clone performs shallow clone, that is clones everything except Body
+// If full clone is needed make sure body is also cloned
 func (req *Request) Clone() *Request {
 	return cloneRequest(req)
 }
@@ -148,16 +155,25 @@ func (req *Request) Transport() string {
 	return tp
 }
 
-// Source will return host:port address
+// Source will return host:port address using what is set by SetSource or based on Via header value
 // In case of network parsed request source will be connection remote address
 func (req *Request) Source() string {
 	if src := req.MessageData.Source(); src != "" {
 		return src
 	}
+	return req.sourceVia()
+}
 
+// sourceVia returns addr based on Via Header.
+func (req *Request) sourceVia() string {
+	host, port := req.sourceViaHostPort()
+	return fmt.Sprintf("%s:%d", uriNetIP(host), port)
+}
+
+func (req *Request) sourceViaHostPort() (string, int) {
 	viaHop := req.Via()
 	if viaHop == nil {
-		return ""
+		return "", 0
 	}
 
 	var (
@@ -184,7 +200,7 @@ func (req *Request) Source() string {
 		}
 	}
 
-	return fmt.Sprintf("%v:%v", host, port)
+	return host, port
 }
 
 // TODO: return Addr instead string, to remove double string parsing
@@ -215,20 +231,20 @@ func (req *Request) Destination() string {
 	return fmt.Sprintf("%v:%v", host, port)
 }
 
-// NewAckRequest creates ACK request for 2xx INVITE
-// https://tools.ietf.org/html/rfc3261#section-13.2.2.4
-// NOTE: it does not copy Via header. This is left to transport or caller to enforce
-// Deprecated: use DialogClient for building dialogs
-func NewAckRequest(inviteRequest *Request, inviteResponse *Response, body []byte) *Request {
-	Recipient := &inviteRequest.Recipient
-	if contact := inviteResponse.Contact(); contact != nil {
-		Recipient = &contact.Address
-	}
+// newAckRequestNon2xx follows rules as here. This is not dialog ACK instead it is transaction ACK.
+// https://datatracker.ietf.org/doc/html/rfc3261#section-17.1.1.3
+func newAckRequestNon2xx(inviteRequest *Request, inviteResponse *Response, body []byte) *Request {
+	recipient := &inviteRequest.Recipient
 	ackRequest := NewRequest(
 		ACK,
-		*Recipient.Clone(),
+		*recipient.Clone(),
 	)
 	ackRequest.SipVersion = inviteRequest.SipVersion
+
+	// 	The ACK MUST contain a single Via header field, and
+	//  this MUST be equal to the top Via header field of the original
+	//  request.
+	CopyHeaders("Via", inviteRequest, ackRequest)
 
 	if len(inviteRequest.GetHeaders("Route")) > 0 {
 		CopyHeaders("Route", inviteRequest, ackRequest)
@@ -259,19 +275,11 @@ func NewAckRequest(inviteRequest *Request, inviteResponse *Response, body []byte
 		ackRequest.AppendHeader(h.headerClone())
 	}
 
+	// Seq header field in the ACK MUST contain the same
+	//    value for the sequence number as was present in the original request,
+	//    but the method parameter MUST be equal to "ACK"
 	cseq := ackRequest.CSeq()
 	cseq.MethodName = ACK
-
-	/*
-	   	A UAC SHOULD include a Contact header field in any target refresh
-	    requests within a dialog, and unless there is a need to change it,
-	    the URI SHOULD be the same as used in previous requests within the
-	    dialog.  If the "secure" flag is true, that URI MUST be a SIPS URI.
-	    As discussed in Section 12.2.2, a Contact header field in a target
-	    refresh request updates the remote target URI.  This allows a UA to
-	    provide a new contact address, should its address change during the
-	    duration of the dialog.
-	*/
 
 	if h := inviteRequest.Contact(); h != nil {
 		ackRequest.AppendHeader(h.headerClone())
@@ -280,20 +288,11 @@ func NewAckRequest(inviteRequest *Request, inviteResponse *Response, body []byte
 	ackRequest.SetBody(body)
 	ackRequest.SetTransport(inviteRequest.Transport())
 	ackRequest.SetSource(inviteRequest.Source())
-	ackRequest.SetDestination(inviteRequest.Destination())
-
-	return ackRequest
-}
-
-func newAckRequestNon2xx(inviteRequest *Request, inviteResponse *Response, body []byte) *Request {
-	ackRequest := NewAckRequest(inviteRequest, inviteResponse, body)
-
-	CopyHeaders("Via", inviteRequest, ackRequest)
-	if inviteResponse.IsSuccess() {
-		// update branch, 2xx ACK is separate Tx
-		viaHop := ackRequest.Via()
-		viaHop.Params.Add("branch", GenerateBranch())
-	}
+	// if inviteResponse.IsSuccess() {
+	// 	// update branch, 2xx ACK is separate Tx
+	// 	viaHop := ackRequest.Via()
+	// 	viaHop.Params.Add("branch", GenerateBranch())
+	// }
 	return ackRequest
 }
 
@@ -333,6 +332,10 @@ func newCancelRequest(requestForCancel *Request) *Request {
 	return cancelReq
 }
 
+func (r *Request) remoteAddress() Addr {
+	return r.raddr
+}
+
 func cloneRequest(req *Request) *Request {
 	newReq := NewRequest(
 		req.Method,
@@ -343,18 +346,12 @@ func cloneRequest(req *Request) *Request {
 	for _, h := range req.CloneHeaders() {
 		newReq.AppendHeader(h)
 	}
-	// for _, h := range cloneHeaders(req) {
-	// 	newReq.AppendHeader(h)
-	// }
-
-	// newReq.SetBody(req.Body())
+	newReq.SetBody(slices.Clone(req.Body()))
 	newReq.SetTransport(req.Transport())
 	newReq.SetSource(req.Source())
 	newReq.SetDestination(req.Destination())
+	newReq.raddr = req.raddr
+	newReq.Laddr = req.Laddr
 
 	return newReq
-}
-
-func CopyRequest(req *Request) *Request {
-	return cloneRequest(req)
 }

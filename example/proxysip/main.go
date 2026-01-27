@@ -2,11 +2,18 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"flag"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"runtime"
+	"runtime/pprof"
 	"strconv"
 	"time"
 
@@ -19,14 +26,13 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
+	slogzerolog "github.com/samber/slog-zerolog/v2"
 	// _ "go.uber.org/automaxprocs"
 )
 
-var ()
-
 func main() {
-	debflag := flag.Bool("debug", false, "")
+	defer pprof.Lookup("goroutine").WriteTo(os.Stdout, 1)
+
 	pprof := flag.Bool("pprof", false, "Full profile")
 	extIP := flag.String("ip", "127.0.0.1:5060", "My exernal ip")
 	dst := flag.String("dst", "", "Destination pbx, sip server")
@@ -40,26 +46,30 @@ func main() {
 		runtime.MemProfileRate = 64
 	}
 
-	lev := zerolog.InfoLevel
-	debuglev := os.Getenv("LOGDEBUG")
-	if *debflag || debuglev != "" {
-		lev = zerolog.DebugLevel
-		sip.SIPDebug = true
+	var lvl slog.Level
+	if err := lvl.UnmarshalText([]byte(os.Getenv("LOG_LEVEL"))); err != nil {
+		lvl = slog.LevelInfo
 	}
+	slog.SetLogLoggerLevel(lvl)
 
-	zerolog.TimeFieldFormat = zerolog.TimeFormatUnixMicro
-	log.Logger = zerolog.New(zerolog.ConsoleWriter{
+	zerologLogger := zerolog.New(zerolog.ConsoleWriter{
 		Out:        os.Stdout,
 		TimeFormat: time.StampMicro,
-	}).With().Timestamp().Logger().Level(lev)
+	}).With().Timestamp().Logger()
+	log := slog.New(slogzerolog.Option{Level: lvl, Logger: &zerologLogger}.NewZerologHandler())
+	slog.SetDefault(log)
 
-	log.Info().Int("cpus", runtime.NumCPU()).Msg("Runtime")
-	log.Info().Msg("Server routes setuped")
+	log.Info("Runtime", "cpus", runtime.NumCPU())
+	log.Info("Server routes setuped")
 	go httpServer(":8080")
 
 	srv := setupSipProxy(*dst, *extIP)
-	if err := srv.ListenAndServe(context.TODO(), *transportType, *extIP); err != nil {
-		log.Error().Err(err).Msg("Fail to start sip server")
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	if err := srv.ListenAndServe(ctx, *transportType, *extIP); err != nil {
+		log.Error("Fail to start sip server", "error", err)
 		return
 	}
 }
@@ -81,28 +91,32 @@ func httpServer(address string) {
 	})
 	statsviz.Register(http.DefaultServeMux)
 
-	log.Info().Msgf("Http server started address=%s", address)
+	slog.Info("Http server started", "address", address)
 	http.ListenAndServe(address, nil)
 }
 
 func setupSipProxy(proxydst string, ip string) *sipgo.Server {
+	log := slog.Default()
 	// Prepare all variables we need for our service
 	host, port, _ := sip.ParseAddr(ip)
 	ua, err := sipgo.NewUA()
 	if err != nil {
-		log.Fatal().Err(err).Msg("Fail to setup user agent")
+		log.Error("Fail to setup user agent", "error", err)
+		return nil
 	}
 
 	srv, err := sipgo.NewServer(ua)
 	if err != nil {
-		log.Fatal().Err(err).Msg("Fail to setup server handle")
+		log.Error("Fail to setup server handle", "error", err)
+		return nil
 	}
 
 	client, err := sipgo.NewClient(ua, sipgo.WithClientAddr(
 		ip,
 	))
 	if err != nil {
-		log.Fatal().Err(err).Msg("Fail to setup client handle")
+		log.Error("Fail to setup client handle", "error", err)
+		return nil
 	}
 
 	registry := NewRegistry()
@@ -117,11 +131,11 @@ func setupSipProxy(proxydst string, ip string) *sipgo.Server {
 		return dst
 	}
 
-	var reply = func(tx sip.ServerTransaction, req *sip.Request, code sip.StatusCode, reason string) {
+	var reply = func(tx sip.ServerTransaction, req *sip.Request, code int, reason string) {
 		resp := sip.NewResponseFromRequest(req, code, reason, nil)
 		resp.SetDestination(req.Source()) //This is optional, but can make sure not wrong via is read
 		if err := tx.Respond(resp); err != nil {
-			log.Error().Err(err).Msg("Fail to respond on transaction")
+			log.Error("Fail to respond on transaction", "error", err)
 		}
 	}
 
@@ -141,14 +155,14 @@ func setupSipProxy(proxydst string, ip string) *sipgo.Server {
 		// Start client transaction and relay our request
 		clTx, err := client.TransactionRequest(ctx, req, sipgo.ClientRequestAddVia, sipgo.ClientRequestAddRecordRoute)
 		if err != nil {
-			log.Error().Err(err).Msg("RequestWithContext  failed")
+			log.Error("RequestWithContext  failed", "error", err)
 			reply(tx, req, 500, "")
 			return
 		}
 		defer clTx.Terminate()
 
 		// Keep monitoring transactions, and proxy client responses to server transaction
-		log.Debug().Str("req", req.Method.String()).Msg("Starting transaction")
+		log.Debug("Starting transaction", "req", req.Method.String())
 		for {
 			select {
 
@@ -165,33 +179,57 @@ func setupSipProxy(proxydst string, ip string) *sipgo.Server {
 				// Removes top most header
 				res.RemoveHeader("Via")
 				if err := tx.Respond(res); err != nil {
-					log.Error().Err(err).Msg("ResponseHandler transaction respond failed")
+					log.Error("ResponseHandler transaction respond failed", "error", err)
 				}
 
-				// Early terminate
-				// if req.Method == sip.BYE {
-				// 	// We will call client Terminate
-				// 	return
-				// }
+			// Early terminate
+			// if req.Method == sip.BYE {
+			// 	// We will call client Terminate
+			// 	return
+			// }
+			case <-clTx.Done():
+				if err := tx.Err(); err != nil {
+					if errors.Is(err, sip.ErrTransactionTerminated) {
+						return
+					}
+					log.Error("Client Transaction done with error", "error", err, "req", req.Method.String(), "callid", req.CallID().Value())
+				}
+				return
 
 			case m := <-tx.Acks():
 				// Acks can not be send directly trough destination
-				log.Info().Str("m", m.StartLine()).Str("dst", dst).Msg("Proxing ACK")
+				log.Info("Proxing ACK", "req", req.Method.String(), "dst", dst)
 				m.SetDestination(dst)
 				client.WriteRequest(m)
 
-			case m := <-tx.Cancels():
-				// Send response imediatelly
-				reply(tx, m, 200, "OK")
-				// Cancel client transacaction without waiting. This will send CANCEL request
-				clTx.Cancel()
-
 			case <-tx.Done():
 				if err := tx.Err(); err != nil {
-					log.Error().Err(err).Str("req", req.Method.String()).Msg("Transaction done with error")
+					if errors.Is(err, sip.ErrTransactionCanceled) {
+						// Cancel other side. This is only on INVITE needed
+						// We need now new transaction
+						if req.IsInvite() {
+							r := newCancelRequest(req)
+							res, err := client.Do(ctx, r)
+							if err != nil {
+								log.Error("Canceling transaction failed", "error", err, "req", req.Method.String())
+								return
+							}
+							if res.StatusCode != 200 {
+								log.Error("Canceling transaction failed with non 200 code", "error", err, "req", req.Method.String())
+								return
+							}
+							return
+						}
+					}
+
+					if errors.Is(err, sip.ErrTransactionTerminated) {
+						return
+					}
+
+					log.Error("Transaction done with error", "error", err, "req", req.Method.String(), "callid", req.CallID().Value())
 					return
 				}
-				log.Debug().Str("req", req.Method.String()).Msg("Transaction done")
+				log.Debug("Transaction done", "req", req.Method.String())
 				return
 			}
 		}
@@ -215,7 +253,7 @@ func setupSipProxy(proxydst string, ip string) *sipgo.Server {
 		addr := uri.Host + ":" + strconv.Itoa(uri.Port)
 
 		registry.Add(uri.User, addr)
-		log.Debug().Msgf("Contact added %s -> %s", uri.User, addr)
+		log.Debug(fmt.Sprintf("Contact added %s -> %s", uri.User, addr))
 
 		res := sip.NewResponseFromRequest(req, 200, "OK", nil)
 		// log.Debug().Msgf("Sending response: \n%s", res.String())
@@ -225,7 +263,7 @@ func setupSipProxy(proxydst string, ip string) *sipgo.Server {
 		cont.Address.UriParams.Add("transport", req.Transport())
 
 		if err := tx.Respond(res); err != nil {
-			log.Error().Err(err).Msg("Sending REGISTER OK failed")
+			log.Error("Sending REGISTER OK failed", "error", err)
 			return
 		}
 	}
@@ -241,7 +279,7 @@ func setupSipProxy(proxydst string, ip string) *sipgo.Server {
 		}
 		req.SetDestination(dst)
 		if err := client.WriteRequest(req, sipgo.ClientRequestAddVia); err != nil {
-			log.Error().Err(err).Msg("Send failed")
+			log.Error("Send failed", "error", err)
 			reply(tx, req, 500, "")
 		}
 	}
@@ -260,4 +298,38 @@ func setupSipProxy(proxydst string, ip string) *sipgo.Server {
 	srv.OnCancel(cancelHandler)
 	srv.OnBye(byeHandler)
 	return srv
+}
+
+func newCancelRequest(inviteRequest *sip.Request) *sip.Request {
+	cancelReq := sip.NewRequest(sip.CANCEL, inviteRequest.Recipient)
+	cancelReq.AppendHeader(sip.HeaderClone(inviteRequest.Via())) // Cancel request must match invite TOP via and only have that Via
+	cancelReq.AppendHeader(sip.HeaderClone(inviteRequest.From()))
+	cancelReq.AppendHeader(sip.HeaderClone(inviteRequest.To()))
+	cancelReq.AppendHeader(sip.HeaderClone(inviteRequest.CallID()))
+	sip.CopyHeaders("Route", inviteRequest, cancelReq)
+	cancelReq.SetSource(inviteRequest.Source())
+	cancelReq.SetDestination(inviteRequest.Destination())
+	return cancelReq
+}
+
+func generateTLSConfig(certFile string, keyFile string, rootPems []byte) (*tls.Config, error) {
+	roots := x509.NewCertPool()
+	if rootPems != nil {
+		ok := roots.AppendCertsFromPEM(rootPems)
+		if !ok {
+			return nil, fmt.Errorf("failed to parse root certificate")
+		}
+	}
+
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("fail to load cert. err=%w", err)
+	}
+
+	conf := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      roots,
+	}
+
+	return conf, nil
 }

@@ -6,122 +6,137 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"sync"
-
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
+	"time"
 )
 
 // TCP transport implementation
-type transportTCP struct {
-	addr      string
-	transport string
-	parser    *Parser
-	log       zerolog.Logger
+type TransportTCP struct {
+	transport       string
+	parser          *Parser
+	log             *slog.Logger
+	connectionReuse bool
 
-	pool ConnectionPool
+	pool *connectionPool
+
+	DialerCreate func(laddr net.Addr) net.Dialer
 }
 
-func newTCPTransport(par *Parser) *transportTCP {
-	p := &transportTCP{
-		parser:    par,
-		pool:      NewConnectionPool(),
-		transport: TransportTCP,
+func (t *TransportTCP) init(par *Parser) {
+	t.parser = par
+	t.pool = newConnectionPool()
+	t.transport = "TCP"
+	if t.log == nil {
+		t.log = DefaultLogger()
 	}
-	p.log = log.Logger.With().Str("caller", "transport<TCP>").Logger()
-	return p
+	if t.DialerCreate == nil {
+		t.DialerCreate = func(laddr net.Addr) net.Dialer {
+			return net.Dialer{
+				Timeout:   1 * time.Minute,
+				LocalAddr: laddr,
+			}
+		}
+	}
 }
 
-func (t *transportTCP) String() string {
-	return "transport<TCP>"
+func (t *TransportTCP) String() string {
+	return "Transport<TCP>"
 }
 
-func (t *transportTCP) Network() string {
+func (t *TransportTCP) Network() string {
 	// return "tcp"
 	return t.transport
 }
 
-func (t *transportTCP) Close() error {
+func (t *TransportTCP) Close() error {
 	// return t.connections.Done()
-	t.pool.Clear()
-	return nil
+	return t.pool.Clear()
 }
 
 // Serve is direct way to provide conn on which this worker will listen
-func (t *transportTCP) Serve(l net.Listener, handler MessageHandler) error {
-	t.log.Debug().Msgf("begin listening on %s %s", t.Network(), l.Addr().String())
+func (t *TransportTCP) Serve(l net.Listener, handler MessageHandler) error {
+	t.log.Debug("begin listening on", "network", t.Network(), "laddr", l.Addr().String())
 	for {
 		conn, err := l.Accept()
 		if err != nil {
-			t.log.Debug().Err(err).Msg("Fail to accept conenction")
+			t.log.Debug("Fail to accept conenction", "error", err)
 			return err
 		}
-
 		t.initConnection(conn, conn.RemoteAddr().String(), handler)
 	}
 }
 
-func (t *transportTCP) GetConnection(addr string) (Connection, error) {
+func (t *TransportTCP) GetConnection(addr string) Connection {
 	c := t.pool.Get(addr)
-	return c, nil
+	return c
 }
 
-func (t *transportTCP) CreateConnection(ctx context.Context, laddr Addr, raddr Addr, handler MessageHandler) (Connection, error) {
+func (t *TransportTCP) CreateConnection(ctx context.Context, laddr Addr, raddr Addr, handler MessageHandler) (Connection, error) {
 	// We are letting transport layer to resolve our address
 	// raddr, err := net.ResolveTCPAddr("tcp", addr)
 	// if err != nil {
 	// 	return nil, err
 	// }
-	var tladdr *net.TCPAddr = nil
-	if laddr.IP != nil {
-		tladdr = &net.TCPAddr{
-			IP:   laddr.IP,
-			Port: laddr.Port,
+	// We do singleflight if laddr is required or connection reuse
+	conn, err := t.pool.addSingleflight(raddr, laddr, t.connectionReuse, func() (Connection, error) {
+		var tladdr *net.TCPAddr = nil
+		if laddr.IP != nil {
+			tladdr = &net.TCPAddr{
+				IP:   laddr.IP,
+				Port: laddr.Port,
+			}
 		}
-	}
 
-	traddr := &net.TCPAddr{
-		IP:   raddr.IP,
-		Port: raddr.Port,
-	}
-	return t.createConnection(ctx, tladdr, traddr, handler)
-}
+		traddr := &net.TCPAddr{
+			IP:   raddr.IP,
+			Port: raddr.Port,
+		}
 
-func (t *transportTCP) createConnection(ctx context.Context, laddr *net.TCPAddr, raddr *net.TCPAddr, handler MessageHandler) (Connection, error) {
-	addr := raddr.String()
-	t.log.Debug().Str("raddr", addr).Msg("Dialing new connection")
+		addr := traddr.String()
+		t.log.Debug("Dialing new connection", "raddr", addr)
 
-	d := net.Dialer{
-		LocalAddr: laddr,
-	}
-	conn, err := d.DialContext(ctx, "tcp", addr)
+		d := t.DialerCreate(tladdr)
+
+		conn, err := d.DialContext(ctx, "tcp", addr)
+		if err != nil {
+			return nil, fmt.Errorf("%s dial err=%w", t, err)
+		}
+
+		// if err := conn.SetKeepAlive(true); err != nil {
+		// 	return nil, fmt.Errorf("%s keepalive err=%w", t, err)
+		// }
+
+		// if err := conn.SetKeepAlivePeriod(30 * time.Second); err != nil {
+		// 	return nil, fmt.Errorf("%s keepalive period err=%w", t, err)
+		// }
+
+		t.log.Debug("New connection", "raddr", raddr)
+		c := &TCPConnection{
+			Conn:     conn,
+			refcount: 2 + TransportIdleConnection, // 1 returning + 1 reading + Idle
+		}
+
+		go t.readConnection(c, c.LocalAddr().String(), c.RemoteAddr().String(), handler)
+		return c, nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("%s dial err=%w", t, err)
+		return nil, err
 	}
 
-	// if err := conn.SetKeepAlive(true); err != nil {
-	// 	return nil, fmt.Errorf("%s keepalive err=%w", t, err)
-	// }
-
-	// if err := conn.SetKeepAlivePeriod(30 * time.Second); err != nil {
-	// 	return nil, fmt.Errorf("%s keepalive period err=%w", t, err)
-	// }
-	c := t.initConnection(conn, addr, handler)
-
-	// Increase ref by 1 before returnin
-	c.Ref(1)
+	c := conn.(*TCPConnection)
 	return c, nil
 }
 
-func (t *transportTCP) initConnection(conn net.Conn, raddr string, handler MessageHandler) Connection {
+func (t *TransportTCP) initConnection(conn net.Conn, raddr string, handler MessageHandler) Connection {
 	// // conn.SetKeepAlive(true)
 	// conn.SetKeepAlivePeriod(3 * time.Second)
 	laddr := conn.LocalAddr().String()
-	t.log.Debug().Str("raddr", raddr).Msg("New connection")
+	t.log.Debug("New connection", "raddr", raddr)
 	c := &TCPConnection{
 		Conn:     conn,
-		refcount: 1 + IdleConnection,
+		refcount: 1 + TransportIdleConnection,
 	}
 	t.pool.Add(laddr, c)
 	t.pool.Add(raddr, c)
@@ -130,10 +145,14 @@ func (t *transportTCP) initConnection(conn net.Conn, raddr string, handler Messa
 }
 
 // This should performe better to avoid any interface allocation
-func (t *transportTCP) readConnection(conn *TCPConnection, laddr string, raddr string, handler MessageHandler) {
-	buf := make([]byte, transportBufferSize)
+func (t *TransportTCP) readConnection(conn *TCPConnection, laddr string, raddr string, handler MessageHandler) {
+	buf := make([]byte, TransportBufferReadSize)
 	defer t.pool.Delete(laddr)
-	defer t.pool.CloseAndDelete(conn, raddr)
+	defer func() {
+		if err := t.pool.CloseAndDelete(conn, raddr); err != nil {
+			t.log.Warn("connection pool not clean cleanup", "error", err)
+		}
+	}()
 
 	// Create stream parser context
 	par := t.parser.NewSIPStream()
@@ -142,11 +161,11 @@ func (t *transportTCP) readConnection(conn *TCPConnection, laddr string, raddr s
 		num, err := conn.Read(buf)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
-				t.log.Debug().Err(err).Msg("connection was closed")
+				t.log.Debug("connection was closed", "error", err)
 				return
 			}
 
-			t.log.Error().Err(err).Msg("Read error")
+			t.log.Error("Read error", "error", err)
 			return
 		}
 
@@ -161,15 +180,14 @@ func (t *transportTCP) readConnection(conn *TCPConnection, laddr string, raddr s
 			// One or 2 CRLF
 			// https://datatracker.ietf.org/doc/html/rfc5626#section-3.5.1
 			if len(bytes.Trim(data, "\r\n")) == 0 {
-				t.log.Debug().Msg("Keep alive CRLF received")
+				t.log.Debug("Keep alive CRLF received")
 				if datalen == 4 {
 					// 2 CRLF is ping
 					if _, err := conn.Write(data[:2]); err != nil {
-						t.log.Error().Err(err).Msg("Failed to pong keep alive")
+						t.log.Error("Failed to pong keep alive", "error", err)
 						return
 					}
 				}
-
 				continue
 			}
 		}
@@ -181,35 +199,20 @@ func (t *transportTCP) readConnection(conn *TCPConnection, laddr string, raddr s
 	}
 }
 
-func (t *transportTCP) parseStream(par *ParserStream, data []byte, src string, handler MessageHandler) {
-	msgs, err := par.ParseSIPStream(data)
-	if err == ErrParseSipPartial {
-		return
-	}
-
-	for _, msg := range msgs {
-		if err != nil {
-			t.log.Error().Err(err).Str("data", string(data)).Msg("failed to parse")
-			return
-		}
-
+func (t *TransportTCP) parseStream(par *ParserStream, data []byte, src string, handler MessageHandler) {
+	err := par.ParseSIPStream(data, func(msg Message) {
 		msg.SetTransport(t.Network())
 		msg.SetSource(src)
 		handler(msg)
-	}
-}
+	})
 
-// TODO use this when message size limit is defined
-func (t *transportTCP) parseFull(data []byte, src string, handler MessageHandler) {
-	msg, err := t.parser.ParseSIP(data) //Very expensive operation
 	if err != nil {
-		t.log.Error().Err(err).Str("data", string(data)).Msg("failed to parse")
+		if err == ErrParseSipPartial {
+			return
+		}
+		t.log.Error("failed to parse", "error", err, "data", string(data))
 		return
 	}
-
-	msg.SetTransport(t.Network())
-	msg.SetSource(src)
-	handler(msg)
 }
 
 type TCPConnection struct {
@@ -224,7 +227,7 @@ func (c *TCPConnection) Ref(i int) int {
 	c.refcount += i
 	ref := c.refcount
 	c.mu.Unlock()
-	log.Debug().Str("ip", c.LocalAddr().String()).Str("dst", c.RemoteAddr().String()).Int("ref", ref).Msg("TCP reference increment")
+	DefaultLogger().Debug("TCP reference increment", "ip", c.LocalAddr().String(), "dst", c.RemoteAddr().String(), "ref", ref)
 	return ref
 }
 
@@ -232,7 +235,7 @@ func (c *TCPConnection) Close() error {
 	c.mu.Lock()
 	c.refcount = 0
 	c.mu.Unlock()
-	log.Debug().Str("ip", c.LocalAddr().String()).Str("dst", c.RemoteAddr().String()).Int("ref", 0).Msg("TCP doing hard close")
+	DefaultLogger().Debug("TCP doing hard close", "ip", c.LocalAddr().String(), "dst", c.RemoteAddr().String(), "ref", 0)
 	return c.Conn.Close()
 }
 
@@ -241,17 +244,17 @@ func (c *TCPConnection) TryClose() (int, error) {
 	c.refcount--
 	ref := c.refcount
 	c.mu.Unlock()
-	log.Debug().Str("ip", c.LocalAddr().String()).Str("dst", c.RemoteAddr().String()).Int("ref", ref).Msg("TCP reference decrement")
+	DefaultLogger().Debug("TCP reference decrement", "ip", c.LocalAddr().String(), "dst", c.RemoteAddr().String(), "ref", ref)
 	if ref > 0 {
 		return ref, nil
 	}
 
 	if ref < 0 {
-		log.Warn().Str("ip", c.LocalAddr().String()).Str("dst", c.RemoteAddr().String()).Int("ref", ref).Msg("TCP ref went negative")
+		DefaultLogger().Warn("TCP ref went negative", "ip", c.LocalAddr().String(), "dst", c.RemoteAddr().String(), "ref", ref)
 		return 0, nil
 	}
 
-	log.Debug().Str("ip", c.LocalAddr().String()).Str("dst", c.RemoteAddr().String()).Int("ref", ref).Msg("TCP closing")
+	DefaultLogger().Debug("TCP closing", "ip", c.LocalAddr().String(), "dst", c.RemoteAddr().String(), "ref", ref)
 	return ref, c.Conn.Close()
 }
 
@@ -259,7 +262,7 @@ func (c *TCPConnection) Read(b []byte) (n int, err error) {
 	// Some debug hook. TODO move to proper way
 	n, err = c.Conn.Read(b)
 	if SIPDebug {
-		log.Debug().Msgf("TCP read %s <- %s:\n%s", c.Conn.LocalAddr().String(), c.Conn.RemoteAddr(), string(b[:n]))
+		logSIPRead("TCP", c.Conn.LocalAddr().String(), c.Conn.RemoteAddr().String(), b[:n])
 	}
 	return n, err
 }
@@ -268,7 +271,7 @@ func (c *TCPConnection) Write(b []byte) (n int, err error) {
 	// Some debug hook. TODO move to proper way
 	n, err = c.Conn.Write(b)
 	if SIPDebug {
-		log.Debug().Msgf("TCP write %s -> %s:\n%s", c.Conn.LocalAddr().String(), c.Conn.RemoteAddr(), string(b[:n]))
+		logSIPWrite("TCP", c.Conn.LocalAddr().String(), c.Conn.RemoteAddr().String(), b[:n])
 	}
 	return n, err
 }

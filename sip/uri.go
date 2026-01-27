@@ -10,12 +10,15 @@ import (
 // sip:user:password@host:port;uri-parameters?headers
 // In case of `sips:“ Encrypted is set to true
 type Uri struct {
-	// True if and only if the URI is a SIPS URI.
-	Encrypted bool
-	Wildcard  bool
+	Scheme string
+
+	// If value is star (*)
+	Wildcard bool
+
+	// if // is present
+	HierarhicalSlashes bool
 
 	// The user part of the URI: the 'joe' in sip:joe@bloggs.com
-	// This is a pointer, so that URIs without a user part can have 'nil'.
 	User string
 
 	// The password field of the URI. This is represented in the URI as joe:hunter2@bloggs.com.
@@ -51,13 +54,18 @@ func (uri *Uri) String() string {
 
 // StringWrite writes uri string to buffer
 func (uri *Uri) StringWrite(buffer io.StringWriter) {
-	// Compulsory protocol identifier.
-	if uri.IsEncrypted() {
-		buffer.WriteString("sips")
-		buffer.WriteString(":")
-	} else {
-		buffer.WriteString("sip")
-		buffer.WriteString(":")
+	// Normally we expect sip or sips, but it can be tel, urn
+	scheme := uri.Scheme
+	// For backward compatibility. No scheme defaults to sip
+	if uri.Scheme == "" {
+		scheme = "sip"
+	}
+
+	buffer.WriteString(scheme)
+	buffer.WriteString(":")
+
+	if uri.HierarhicalSlashes {
+		buffer.WriteString("//")
 	}
 
 	// Optional userinfo part.
@@ -71,7 +79,7 @@ func (uri *Uri) StringWrite(buffer io.StringWriter) {
 	}
 
 	// Compulsory hostname.
-	buffer.WriteString(uri.Host)
+	buffer.WriteString(uriIP(uri.Host))
 
 	// Optional port number.
 	if uri.Port > 0 {
@@ -104,7 +112,7 @@ func (uri *Uri) Clone() *Uri {
 
 // IsEncrypted returns true if uri is SIPS uri
 func (uri *Uri) IsEncrypted() bool {
-	return uri.Encrypted
+	return uri.Scheme == "sips"
 }
 
 // Endpoint is uri user identifier. user@host[:port]
@@ -118,15 +126,24 @@ func (uri *Uri) Endpoint() string {
 
 // Addr is uri part without headers and params. sip[s]:user@host[:port]
 func (uri *Uri) Addr() string {
-	addr := uri.User + "@" + uri.Host
+	scheme := uri.Scheme
+	// For backward compatibility. No scheme defaults to sip
+	if uri.Scheme == "" {
+		scheme = "sip"
+	}
+
+	addr := uri.Host
+	if uri.User != "" {
+		addr = uri.User + "@" + addr
+	}
 	if uri.Port > 0 {
 		addr += ":" + strconv.Itoa(uri.Port)
 	}
 
-	if uri.Encrypted {
+	if uri.IsEncrypted() {
 		return "sips:" + addr
 	}
-	return "sip:" + addr
+	return scheme + ":" + addr
 }
 
 // HostPort represents host:port part

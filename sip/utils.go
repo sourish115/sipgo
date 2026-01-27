@@ -10,7 +10,6 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
-	"time"
 )
 
 const (
@@ -19,34 +18,6 @@ const (
 	letterIdxMask = 1<<letterIdxBits - 1 // All 1-bits, as many as letterIdxBits
 	letterIdxMax  = 63 / letterIdxBits   // # of letter indices fitting in 63 bits
 )
-
-func init() {
-	rand.Seed(time.Now().UnixNano())
-}
-
-// https://github.com/kpbird/golang_random_string
-func RandString(n int) string {
-	output := make([]byte, n)
-	// We will take n bytes, one byte for each character of output.
-	randomness := make([]byte, n)
-	// read all random
-	_, err := rand.Read(randomness)
-	if err != nil {
-		panic(err)
-	}
-	l := len(letterBytes)
-	// fill output
-	for pos := range output {
-		// get random item
-		random := randomness[pos]
-		// random % 64
-		randomPos := random % uint8(l)
-		// put into output
-		output[pos] = letterBytes[randomPos]
-	}
-
-	return string(output)
-}
 
 // https://stackoverflow.com/questions/22892120/how-to-generate-a-random-string-of-a-fixed-length-in-go
 func RandStringBytesMask(sb *strings.Builder, n int) string {
@@ -67,11 +38,55 @@ func RandStringBytesMask(sb *strings.Builder, n int) string {
 	return sb.String()
 }
 
+func isASCII(c rune) bool {
+	return 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z'
+}
+
+func asciiToLower(s []byte) []byte {
+	// first check is ascii already low to avoid alloc
+	nonLowInd := -1
+	for i, c := range s {
+		if 'a' <= c && c <= 'z' {
+			continue
+		}
+		nonLowInd = i
+		break
+	}
+	if nonLowInd < 0 {
+		return s
+	}
+
+	b := make([]byte, len(s))
+	copy(b, s[:nonLowInd])
+	for i := nonLowInd; i < len(s); i++ {
+		c := s[i]
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		b[i] = c
+	}
+	return b
+}
+
 // ASCIIToLower is faster than go version. It avoids one more loop
 func ASCIIToLower(s string) string {
+	// first check is ascii already low to avoid alloc
+	nonLowInd := -1
+	for i, c := range s {
+		if 'a' <= c && c <= 'z' {
+			continue
+		}
+		nonLowInd = i
+		break
+	}
+	if nonLowInd < 0 {
+		return s
+	}
+
 	var b strings.Builder
 	b.Grow(len(s))
-	for i := 0; i < len(s); i++ {
+	b.WriteString(s[:nonLowInd])
+	for i := nonLowInd; i < len(s); i++ {
 		c := s[i]
 		if 'A' <= c && c <= 'Z' {
 			c += 'a' - 'A'
@@ -91,6 +106,103 @@ func ASCIIToLowerInPlace(s []byte) {
 	}
 }
 
+func ASCIIToUpper(s string) string {
+	// first check is ascii already up to avoid alloc
+	nonLowInd := -1
+	for i, c := range s {
+		if 'A' <= c && c <= 'Z' {
+			continue
+		}
+		nonLowInd = i
+		break
+	}
+	if nonLowInd < 0 {
+		return s
+	}
+
+	var b strings.Builder
+	b.Grow(len(s))
+	b.WriteString(s[:nonLowInd])
+	for i := nonLowInd; i < len(s); i++ {
+		c := s[i]
+		if 'a' <= c && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
+var (
+	hdrVia           = []byte("via")
+	hdrFrom          = []byte("from")
+	hdrTo            = []byte("to")
+	hdrCallID        = []byte("call-id")
+	hdrContact       = []byte("contact")
+	hdrCSeq          = []byte("cseq")
+	hdrContentType   = []byte("content-type")
+	hdrContentLength = []byte("content-length")
+	hdrRoute         = []byte("route")
+	hdrRecordRoute   = []byte("record-route")
+	hdrMaxForwards   = []byte("max-forwards")
+	hdrTimestamp     = []byte("timestamp")
+)
+
+func headerToLower(s []byte) []byte {
+	if len(s) == 1 {
+		c := s[0]
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		switch c {
+		case 't':
+			return hdrTo
+		case 'f':
+			return hdrFrom
+		case 'v':
+			return hdrVia
+		case 'i':
+			return hdrCallID
+		case 'l':
+			return hdrContentLength
+		case 'c':
+			return hdrContentType
+		case 'm':
+			return hdrContact
+		}
+	}
+	// Avoid allocations
+	switch string(s) {
+	case "Via", "via":
+		return hdrVia
+	case "From", "from":
+		return hdrFrom
+	case "To", "to":
+		return hdrTo
+	case "Call-ID", "call-id":
+		return hdrCallID
+	case "Contact", "contact":
+		return hdrContact
+	case "CSeq", "CSEQ", "cseq":
+		return hdrCSeq
+	case "Content-Type", "content-type":
+		return hdrContentType
+	case "Content-Length", "content-length":
+		return hdrContentLength
+	case "Route", "route":
+		return hdrRoute
+	case "Record-Route", "record-route":
+		return hdrRecordRoute
+	case "Max-Forwards":
+		return hdrMaxForwards
+	case "Timestamp", "timestamp":
+		return hdrTimestamp
+	}
+
+	// This creates one allocation if we really need to lower
+	return asciiToLower(s)
+}
+
 // HeaderToLower is fast ASCII lower string
 func HeaderToLower(s string) string {
 	// Avoid allocations
@@ -105,19 +217,23 @@ func HeaderToLower(s string) string {
 		return "call-id"
 	case "Contact", "contact":
 		return "contact"
-	case "Cseq", "CSEQ", "cseq":
+	case "CSeq", "CSEQ", "cseq":
 		return "cseq"
 	case "Content-Type", "content-type":
 		return "content-type"
+	case "Content-Length", "content-length":
+		return "content-length"
 	case "Route", "route":
 		return "route"
 	case "Record-Route", "record-route":
 		return "record-route"
+	case "Max-Forwards":
+		return "max-forwards"
 	case "Timestamp", "timestamp":
 		return "timestamp"
 	}
 
-	// This creates one allocation
+	// This creates one allocation if we really need to lower
 	return ASCIIToLower(s)
 }
 
@@ -140,7 +256,7 @@ func UriIsSIPS(s string) bool {
 
 // Splits the given string into sections, separated by one or more characters
 // from c_ABNF_WS.
-func SplitByWhitespace(text string) []string {
+func splitByWhitespace(text string) []string {
 	var buffer bytes.Buffer
 	var inString = true
 	result := make([]string, 0)
@@ -167,63 +283,11 @@ func SplitByWhitespace(text string) []string {
 	return result
 }
 
-// A delimiter is any pair of characters used for quoting text (i.e. bulk escaping literals).
-type delimiter struct {
-	start uint8
-	end   uint8
-}
-
-// Define common quote characters needed in parsing.
-var quotesDelim = delimiter{'"', '"'}
-
-var anglesDelim = delimiter{'<', '>'}
-
-// Find the first instance of the target in the given text which is not enclosed in any delimiters
-// from the list provided.
-func findUnescaped(text string, target uint8, delims ...delimiter) int {
-	return findAnyUnescaped(text, string(target), delims...)
-}
-
-// Find the first instance of any of the targets in the given text that are not enclosed in any delimiters
-// from the list provided.
-func findAnyUnescaped(text string, targets string, delims ...delimiter) int {
-	escaped := false
-	var endEscape uint8 = 0
-
-	endChars := make(map[uint8]uint8)
-	for _, delim := range delims {
-		endChars[delim.start] = delim.end
-	}
-
-	for idx := 0; idx < len(text); idx++ {
-		if !escaped && strings.Contains(targets, string(text[idx])) {
-			return idx
-		}
-
-		if escaped {
-			escaped = text[idx] != endEscape
-			continue
-		} else {
-			endEscape, escaped = endChars[text[idx]]
-		}
-	}
-
-	return -1
-}
-
-// ResolveSelfIP returns first non loopback IP
-//
-// Deprecated use ResolveInterfacesIP
-func ResolveSelfIP() (net.IP, error) {
-	ip, _, err := ResolveInterfacesIP("ip4", nil)
-	return ip, err
-}
-
 // ResolveInterfaceIP will check current interfaces and resolve to IP
 // Using targetIP it will try to match interface with same subnet
 // network can be "ip" "ip4" "ip6"
 // by default it avoids loopack IP unless targetIP is loopback
-func ResolveInterfacesIP(network string, targetIP net.IP) (net.IP, net.Interface, error) {
+func ResolveInterfacesIP(network string, targetIP *net.IPNet) (net.IP, net.Interface, error) {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil, net.Interface{}, err
@@ -233,13 +297,14 @@ func ResolveInterfacesIP(network string, targetIP net.IP) (net.IP, net.Interface
 		if iface.Flags&net.FlagUp == 0 {
 			continue // interface down
 		}
+
 		if iface.Flags&net.FlagLoopback != 0 {
-			if targetIP != nil && !targetIP.IsLoopback() {
+			if targetIP != nil && !targetIP.IP.IsLoopback() {
 				continue // loopback interface
 			}
 		}
 
-		ip, err := resolveInterfaceIp(iface, network, targetIP)
+		ip, err := ResolveInterfaceIp(iface, network, targetIP)
 		if errors.Is(err, io.EOF) {
 			continue
 		}
@@ -249,11 +314,12 @@ func ResolveInterfacesIP(network string, targetIP net.IP) (net.IP, net.Interface
 	return nil, net.Interface{}, errors.New("no interface found on system")
 }
 
-func resolveInterfaceIp(iface net.Interface, network string, targetIP net.IP) (net.IP, error) {
+func ResolveInterfaceIp(iface net.Interface, network string, targetIP *net.IPNet) (net.IP, error) {
 	addrs, err := iface.Addrs()
 	if err != nil {
 		return nil, err
 	}
+
 	for _, addr := range addrs {
 		var ip net.IP
 		ipNet, ok := addr.(*net.IPNet)
@@ -263,7 +329,7 @@ func resolveInterfaceIp(iface net.Interface, network string, targetIP net.IP) (n
 		}
 		ip = ipNet.IP
 		if targetIP != nil {
-			if !ipNet.Contains(targetIP) {
+			if !targetIP.Contains(ip) {
 				continue
 			}
 		} else {
@@ -276,19 +342,19 @@ func resolveInterfaceIp(iface net.Interface, network string, targetIP net.IP) (n
 			continue
 		}
 
+		// IP is v6 only if this returns nil
+		isIP4 := ip.To4() != nil
 		switch network {
 		case "ip4":
-			ip = ip.To4()
+			if isIP4 {
+				return ip, nil
+			}
 
 		case "ip6":
-			ip = ip.To16()
+			if !isIP4 {
+				return ip, nil
+			}
 		}
-
-		if ip == nil {
-			continue // not an ipv4 address
-		}
-
-		return ip, nil
 	}
 	return nil, io.EOF
 }
@@ -301,8 +367,8 @@ func NonceWrite(buf []byte) {
 	}
 }
 
-// MessageShortString dumps short version of msg. Used only for logging
-func MessageShortString(msg Message) string {
+// messageShortString dumps short version of msg. Used only for logging
+func messageShortString(msg Message) string {
 	switch m := msg.(type) {
 	case *Request:
 		return m.Short()
@@ -319,4 +385,38 @@ func compareFunctions(fsm1 any, fsm2 any) error {
 		return fmt.Errorf("Functions are not equal f1=%q, f2=%q", funcName1, funcName2)
 	}
 	return nil
+}
+
+func isIPV6(host string) bool {
+	// Quick reject (has dot)
+	for c := range host {
+		if c == '.' {
+			return false
+		}
+		if c == ':' {
+			break
+		}
+	}
+
+	ip := net.ParseIP(host)
+	return ip != nil && ip.To4() == nil
+}
+
+func uriIP(ip string) string {
+	if isIPV6(ip) {
+		return "[" + ip + "]"
+	}
+	return ip
+}
+
+// uriNetIP returns parsable IP by net
+func uriNetIP(ip string) string {
+	return strings.Trim(ip, "[]")
+}
+
+func printStack(args ...any) {
+	buf := make([]byte, 8192)
+	n := runtime.Stack(buf, false)
+	fmt.Println(args...)
+	fmt.Println(string(buf[:n]))
 }

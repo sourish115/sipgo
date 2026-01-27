@@ -5,12 +5,10 @@ import (
 	"testing"
 
 	"github.com/emiago/sipgo/fakes"
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 )
 
 func TestConnectionPool(t *testing.T) {
-	pool := NewConnectionPool()
+	pool := newConnectionPool()
 
 	fakeConn := &fakes.TCPConn{
 		LAddr:  net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5060},
@@ -29,8 +27,7 @@ func TestConnectionPool(t *testing.T) {
 }
 
 func BenchmarkConnectionPool(b *testing.B) {
-	log.Logger = log.Logger.Level(zerolog.WarnLevel)
-	pool := NewConnectionPool()
+	pool := newConnectionPool()
 
 	for i := 0; i < b.N; i++ {
 		conn := &TCPConnection{Conn: &fakes.TCPConn{

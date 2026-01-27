@@ -49,7 +49,7 @@ func TestParseUri(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, "alice", uri.User)
 			assert.Equal(t, "atlanta.com", uri.Host)
-			assert.False(t, uri.Encrypted)
+			assert.False(t, uri.IsEncrypted())
 		}
 
 		testCases = []string{
@@ -62,7 +62,7 @@ func TestParseUri(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, "alice", uri.User)
 			assert.Equal(t, "atlanta.com", uri.Host)
-			assert.True(t, uri.Encrypted)
+			assert.True(t, uri.IsEncrypted())
 		}
 
 	})
@@ -73,16 +73,14 @@ func TestParseUri(t *testing.T) {
 		str = "sip://alice@localhost:5060"
 		err = ParseUri(str, &uri)
 		require.NoError(t, err)
-		assert.Equal(t, "sip:alice@localhost:5060", uri.String())
+		assert.Equal(t, "sip://alice@localhost:5060", uri.String())
 	})
 
 	t.Run("no sip scheme", func(t *testing.T) {
-		// No scheme we currently allow
 		uri = Uri{}
 		str = "alice@localhost:5060"
 		err = ParseUri(str, &uri)
-		require.NoError(t, err)
-		assert.Equal(t, "sip:alice@localhost:5060", uri.String())
+		require.Error(t, err)
 	})
 
 	t.Run("uri params parsed", func(t *testing.T) {
@@ -124,7 +122,7 @@ func TestParseUri(t *testing.T) {
 
 	t.Run("params no value", func(t *testing.T) {
 		uri = Uri{}
-		str = "127.0.0.2:5060;rport;branch=z9hG4bKPj6c65c5d9-b6d0-4a30-9383-1f9b42f97de9"
+		str = "sip:127.0.0.2:5060;rport;branch=z9hG4bKPj6c65c5d9-b6d0-4a30-9383-1f9b42f97de9"
 		err = ParseUri(str, &uri)
 		require.NoError(t, err)
 
@@ -132,8 +130,8 @@ func TestParseUri(t *testing.T) {
 		branch, _ := uri.UriParams.Get("branch")
 		assert.Equal(t, "", rport)
 		assert.Equal(t, "z9hG4bKPj6c65c5d9-b6d0-4a30-9383-1f9b42f97de9", branch)
-
 	})
+
 }
 
 func TestParseUriBad(t *testing.T) {
@@ -142,5 +140,77 @@ func TestParseUriBad(t *testing.T) {
 		uri := Uri{}
 		err := ParseUri(str, &uri)
 		require.Error(t, err)
+	})
+}
+
+func TestParseUriIPV6(t *testing.T) {
+	t.Run("partial", func(t *testing.T) {
+		uri := Uri{}
+		str := "sip:[fe80::dc45:996b:6de9:9746"
+		err := ParseUri(str, &uri)
+		require.Error(t, err)
+	})
+
+	t.Run("too long", func(t *testing.T) {
+		uri := Uri{}
+		str := "sip:[fe80::dc45:996b:6de9:9746:ffff:ffff:ffff:ffff]"
+		err := ParseUri(str, &uri)
+		require.Error(t, err)
+	})
+
+	t.Run("smallest", func(t *testing.T) {
+		uri := Uri{}
+		str := "sip:[fe80::dc45:996b:6de9:9746]"
+		err := ParseUri(str, &uri)
+		require.NoError(t, err)
+
+		assert.Equal(t, "[fe80::dc45:996b:6de9:9746]", uri.Host)
+		assert.Equal(t, 0, uri.Port)
+		assert.Equal(t, "", uri.User)
+	})
+	t.Run("with port", func(t *testing.T) {
+		uri := Uri{}
+		str := "sip:[fe80::dc45:996b:6de9:9746]:5060"
+		err := ParseUri(str, &uri)
+		require.NoError(t, err)
+
+		assert.Equal(t, "[fe80::dc45:996b:6de9:9746]", uri.Host)
+		assert.Equal(t, 5060, uri.Port)
+	})
+
+	t.Run("max length", func(t *testing.T) {
+		uri := Uri{}
+		str := "sip:[2001:0db8:85a3:0000:0000:8a2e:0370:7334]:5060"
+		err := ParseUri(str, &uri)
+		require.NoError(t, err)
+
+		assert.Equal(t, "[2001:0db8:85a3:0000:0000:8a2e:0370:7334]", uri.Host)
+		assert.Equal(t, 5060, uri.Port)
+	})
+
+	t.Run("with params", func(t *testing.T) {
+		uri := Uri{}
+		str := "sip:[fe80::dc45:996b:6de9:9746]:5060;rport;branch=z9hG4bKPj6c65c5d9-b6d0-4a30-9383-1f9b42f97de9"
+		err := ParseUri(str, &uri)
+		require.NoError(t, err)
+
+		assert.Equal(t, "[fe80::dc45:996b:6de9:9746]", uri.Host)
+		assert.Equal(t, 5060, uri.Port)
+
+		rport, _ := uri.UriParams.Get("rport")
+		branch, _ := uri.UriParams.Get("branch")
+		assert.Equal(t, "", rport)
+		assert.Equal(t, "z9hG4bKPj6c65c5d9-b6d0-4a30-9383-1f9b42f97de9", branch)
+	})
+
+	t.Run("with params", func(t *testing.T) {
+		uri := Uri{}
+		str := "sip:user@[fe80::dc45:996b:6de9:9746]:5060;rport;branch=z9hG4bKPj6c65c5d9-b6d0-4a30-9383-1f9b42f97de9"
+		err := ParseUri(str, &uri)
+		require.NoError(t, err)
+
+		assert.Equal(t, "[fe80::dc45:996b:6de9:9746]", uri.Host)
+		assert.Equal(t, 5060, uri.Port)
+		assert.Equal(t, "user", uri.User)
 	})
 }

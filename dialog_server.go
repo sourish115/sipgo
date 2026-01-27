@@ -11,116 +11,22 @@ import (
 	"github.com/icholy/digest"
 )
 
-// DialogServer
-//
-// Deprecated. Will be moved as example of caching dialog
-type DialogServer struct {
-	dialogs sync.Map // TODO replace with typed version
-	ua      DialogUA
-}
-
-func (s *DialogServer) loadDialog(id string) *DialogServerSession {
-	val, ok := s.dialogs.Load(id)
-	if !ok || val == nil {
-		return nil
-	}
-
-	t := val.(*DialogServerSession)
-	return t
-}
-
-func (s *DialogServer) matchDialogRequest(req *sip.Request) (*DialogServerSession, error) {
-	id, err := sip.UASReadRequestDialogID(req)
-	if err != nil {
-		return nil, errors.Join(ErrDialogOutsideDialog, err)
-	}
-
-	dt := s.loadDialog(id)
-	if dt == nil {
-		return nil, ErrDialogDoesNotExists
-	}
-	return dt, nil
-}
-
-// NewDialogServer provides handle for managing UAS dialog
-// Contact hdr is default that is provided for responses.
-// Client is needed for termination dialog session
-// In case handling different transports you should have multiple instances per transport
-//
-// Deprecated: DialogServer cached dialogs, which is mostly something you want todo as caller
-// Using DialogUA is now better way for genereting dialogs without caching and giving you as caller whole control of dialog
-func NewDialogServer(client *Client, contactHDR sip.ContactHeader) *DialogServer {
-	s := &DialogServer{
-		dialogs: sync.Map{},
-		ua: DialogUA{
-			Client:     client,
-			ContactHDR: contactHDR,
-		},
-	}
-	return s
-}
-
-// ReadInvite should read from your OnInvite handler for which it creates dialog context
-// You need to use DialogServerSession for all further responses
-// Do not forget to add ReadAck and ReadBye for confirming dialog and terminating
-func (s *DialogServer) ReadInvite(req *sip.Request, tx sip.ServerTransaction) (*DialogServerSession, error) {
-	// In case dialog exists this will return non nil error
-	// id, err := sip.UASReadRequestDialogID(req)
-	// if err == nil {
-	// 	// Check is our dialog (REINVITE)
-	// 	if d, exists := s.dialogs.Load(id); exists {
-	// 		return d.(*DialogServerSession), nil
-	// 	}
-	// 	return nil, err
-	// }
-
-	dtx, err := s.ua.ReadInvite(req, tx)
-	if err != nil {
-		return nil, err
-	}
-
-	id := dtx.ID
-	dtx.OnClose = func() {
-		s.dialogs.Delete(id)
-	}
-	s.dialogs.Store(id, dtx)
-	return dtx, nil
-}
-
-// ReadAck should read from your OnAck handler
-func (s *DialogServer) ReadAck(req *sip.Request, tx sip.ServerTransaction) error {
-	dt, err := s.matchDialogRequest(req)
-	if err != nil {
-		return err
-	}
-	return dt.ReadAck(req, tx)
-}
-
-// ReadBye should read from your OnBye handler. Returns error if it fails
-func (s *DialogServer) ReadBye(req *sip.Request, tx sip.ServerTransaction) error {
-	dt, err := s.matchDialogRequest(req)
-	if err != nil {
-		return err
-	}
-	return dt.ReadBye(req, tx)
-}
-
 type DialogServerSession struct {
 	Dialog
 	inviteTx sip.ServerTransaction
 	// s        *DialogServer
 	ua *DialogUA
 
-	// OnClose is temporarly fix to handle dialog Closing.
+	// onClose is temporarly fix to handle dialog Closing.
 	// Normally you want to have cleanup after dialog terminating or caller calling Close()
 	// In future this could be only subscribing to dialog state
-	OnClose func()
+	onClose func()
 }
 
 // ReadAck changes dialog state to confiremed
 func (s *DialogServerSession) ReadAck(req *sip.Request, tx sip.ServerTransaction) error {
 	// cseq must match to our last dialog cseq
-	if req.CSeq().SeqNo != s.lastCSeqNo {
+	if req.CSeq().SeqNo != s.lastCSeqNo.Load() {
 		return ErrDialogInvalidCseq
 	}
 	s.setState(sip.DialogStateConfirmed)
@@ -134,7 +40,7 @@ func (s *DialogServerSession) ReadBye(req *sip.Request, tx sip.ServerTransaction
 	}
 
 	defer s.Close()
-	defer s.inviteTx.Terminate() // Terminates Invite transaction
+	defer s.inviteTx.Terminate() // Terminat`es Invite transaction
 
 	res := sip.NewResponseFromRequest(req, 200, "OK", nil)
 	if err := tx.Respond(res); err != nil {
@@ -145,31 +51,99 @@ func (s *DialogServerSession) ReadBye(req *sip.Request, tx sip.ServerTransaction
 	return nil
 }
 
+// Do does request response pattern. For more control over transaction use TransactionRequest
+func (s *DialogServerSession) Do(ctx context.Context, req *sip.Request) (*sip.Response, error) {
+	tx, err := s.TransactionRequest(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Terminate()
+	for {
+		select {
+		case res := <-tx.Responses():
+			if res.IsProvisional() {
+				continue
+			}
+			return res, nil
+
+		case <-tx.Done():
+			return nil, tx.Err()
+
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
 // TransactionRequest is doing client DIALOG request based on RFC
 // https://www.rfc-editor.org/rfc/rfc3261#section-12.2.1
 // This ensures that you have proper request done within dialog
 func (s *DialogServerSession) TransactionRequest(ctx context.Context, req *sip.Request) (sip.ClientTransaction, error) {
+	s.buildReq(req)
+	// Passing option to avoid CSEQ apply
+	return s.ua.Client.TransactionRequest(ctx, req, func(c *Client, req *sip.Request) error {
+		if req.Via() == nil {
+			ClientRequestAddVia(c, req)
+		}
+		// Makes sure Content-Length is present
+		if req.Body() == nil {
+			req.SetBody(nil)
+		}
+		return nil
+	})
+}
+
+func (s *DialogServerSession) WriteRequest(req *sip.Request) error {
+	s.buildReq(req)
+	return s.ua.Client.WriteRequest(req)
+}
+
+func (s *DialogServerSession) buildReq(req *sip.Request) {
+	// Keep any request inside dialog
+	mustHaveHeaders := make([]sip.Header, 0, 5)
+	if h, invH := req.From(), s.InviteResponse; h == nil && invH != nil {
+		hh := invH.To().AsFrom()
+		mustHaveHeaders = append(mustHaveHeaders, &hh)
+	}
+
+	if h, invH := req.To(), s.InviteRequest.From(); h == nil {
+		hh := invH.AsTo()
+		mustHaveHeaders = append(mustHaveHeaders, &hh)
+	}
+
+	if h, invH := req.CallID(), s.InviteRequest.CallID(); h == nil {
+		mustHaveHeaders = append(mustHaveHeaders, sip.HeaderClone(invH))
+	}
+
+	if h := req.MaxForwards(); h == nil {
+		maxFwd := sip.MaxForwardsHeader(70)
+		mustHaveHeaders = append(mustHaveHeaders, &maxFwd)
+	}
+
 	cseq := req.CSeq()
 	if cseq == nil {
 		cseq = &sip.CSeqHeader{
 			SeqNo:      s.InviteRequest.CSeq().SeqNo,
 			MethodName: req.Method,
 		}
-		req.AppendHeader(cseq)
+		mustHaveHeaders = append(mustHaveHeaders, cseq)
+	}
+	if len(mustHaveHeaders) > 0 {
+		req.PrependHeader(mustHaveHeaders...)
 	}
 
 	// For safety make sure we are starting with our last dialog cseq num
-	cseq.SeqNo = s.lastCSeqNo
+	cseq.SeqNo = s.lastCSeqNo.Load()
 
 	if !req.IsAck() && !req.IsCancel() {
 		// Do cseq increment within dialog
-		cseq.SeqNo = s.lastCSeqNo + 1
+		cseq.SeqNo++
 	}
 
 	// https://datatracker.ietf.org/doc/html/rfc3261#section-16.12.1.2
-	hdrs := s.InviteRequest.GetHeaders("Record-Route")
-	for i := len(hdrs) - 1; i >= 0; i-- {
-		recordRoute := hdrs[i]
+	rrs := s.InviteRequest.GetHeaders("Record-Route")
+	for i := range rrs {
+		recordRoute := rrs[i]
 		req.AppendHeader(sip.NewHeader("Route", recordRoute.Value()))
 	}
 
@@ -178,7 +152,6 @@ func (s *DialogServerSession) TransactionRequest(ctx context.Context, req *sip.R
 	if rr := req.Route(); rr != nil {
 		req.SetDestination(rr.Address.HostPort())
 	}
-
 	// TODO check correct behavior strict routing vs loose routing
 	// recordRoute := req.RecordRoute()
 	// if recordRoute != nil {
@@ -197,19 +170,25 @@ func (s *DialogServerSession) TransactionRequest(ctx context.Context, req *sip.R
 	// 	}
 	// }
 
-	s.lastCSeqNo = cseq.SeqNo
-	// Passing option to avoid CSEQ apply
-	return s.ua.Client.TransactionRequest(ctx, req, ClientRequestBuild)
-}
+	s.lastCSeqNo.Store(cseq.SeqNo)
 
-func (s *DialogServerSession) WriteRequest(req *sip.Request) error {
-	return s.ua.Client.WriteRequest(req)
+	if h := req.Contact(); h == nil {
+		req.AppendHeader(sip.HeaderClone(&s.ua.ContactHDR))
+	}
+
+	if s.ua.RewriteContact && len(rrs) == 0 {
+		req.SetDestination(s.InviteRequest.Source())
+	}
+
+	// TODO check is contact header routable
+	// If not then we should force destination as source address
+	req.SetTransport(s.InviteRequest.Transport())
 }
 
 // Close is always good to call for cleanup or terminating dialog state
 func (s *DialogServerSession) Close() error {
-	if s.OnClose != nil {
-		s.OnClose()
+	if s.onClose != nil {
+		s.onClose()
 	}
 	return nil
 }
@@ -219,7 +198,7 @@ func (s *DialogServerSession) Close() error {
 // 2xx for creating dialog or other code in case failure
 //
 // In case Cancel request received: ErrDialogCanceled is responded
-func (s *DialogServerSession) Respond(statusCode sip.StatusCode, reason string, body []byte, headers ...sip.Header) error {
+func (s *DialogServerSession) Respond(statusCode int, reason string, body []byte, headers ...sip.Header) error {
 	// Must copy Record-Route headers. Done by this command
 	res := sip.NewResponseFromRequest(s.InviteRequest, statusCode, reason, body)
 
@@ -280,6 +259,8 @@ func (s *DialogServerSession) authDigest(chal *digest.Challenge, opts digest.Opt
 }
 
 // WriteResponse allows passing you custom response
+// NOTE: Make sure you have built response based on dialog.InviteRequest which makes sure
+// that dialog ID do match
 func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 	tx := s.inviteTx
 
@@ -292,9 +273,6 @@ func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 
 	// Do we have cancel in meantime
 	select {
-	case req := <-tx.Cancels():
-		tx.Respond(sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil))
-		return ErrDialogCanceled
 	case <-tx.Done():
 		// There must be some error
 		return tx.Err()
@@ -322,13 +300,12 @@ func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 		return nil
 	}
 
-	id, err := sip.MakeDialogIDFromResponse(res)
+	id, err := sip.DialogIDFromResponse(res)
 	if err != nil {
 		return err
 	}
 
 	if id != s.Dialog.ID {
-		// TODO. This can be panic
 		return fmt.Errorf("ID do not match. Invite request has changed headers?")
 	}
 
@@ -337,21 +314,66 @@ func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 		return err
 	}
 
+	// Wait now for ACK for our 2xx
+	// https://datatracker.ietf.org/doc/html/rfc3261#section-13.3.1.4
+
+	// We are following RFC 6026, which states that this is TU thing and not Transaction layer.
+	timer := time.NewTimer(sip.T1)
+	defer timer.Stop()
+
+	state := sip.DialogStateEstablished
+	readStateCh := s.StateRead()
+	for state == sip.DialogStateEstablished {
+		select {
+		case <-timer.C:
+			if err := tx.Respond(res); err != nil {
+				return err
+			}
+			// 2xx response is passed to the transport with an
+			//    interval that starts at T1 seconds and doubles for each
+			//    retransmission until it reaches T2 seconds (T1 and T2 are defined in
+			//    Section 17).
+			timer.Reset(max(2*sip.T1, sip.T2))
+
+		case <-time.After(64 * sip.T1):
+			// If the server retransmits the 2xx response for 64*T1 seconds without
+			// receiving an ACK, the dialog is confirmed, but the session SHOULD be
+			// terminated.  This is accomplished with a BYE, as described in Section
+			// 15.
+			state = sip.DialogStateConfirmed
+		case state = <-readStateCh:
+		}
+	}
+	if state != sip.DialogStateConfirmed {
+		return fmt.Errorf("No ACK received")
+	}
 	return nil
 }
 
 func (s *DialogServerSession) Bye(ctx context.Context) error {
+	req := s.Dialog.InviteRequest
+	cont := s.Dialog.InviteRequest.Contact()
+	bye := sip.NewRequest(sip.BYE, cont.Address)
+	bye.SetTransport(req.Transport())
+
+	return s.WriteBye(ctx, bye)
+}
+
+func (s *DialogServerSession) WriteBye(ctx context.Context, bye *sip.Request) error {
 	state := s.state.Load()
 	// In case dialog terminated
 	if sip.DialogState(state) == sip.DialogStateEnded {
 		return nil
 	}
 
+	// https://datatracker.ietf.org/doc/html/rfc3261#section-15
+	// However, the callee's UA MUST NOT send a BYE on a confirmed dialog
+	// until it has received an ACK for its 2xx response or until the server
+	// transaction times out.
 	if sip.DialogState(state) != sip.DialogStateConfirmed {
 		return nil
 	}
 
-	req := s.Dialog.InviteRequest
 	res := s.Dialog.InviteResponse
 
 	if !res.IsSuccess() {
@@ -360,11 +382,6 @@ func (s *DialogServerSession) Bye(ctx context.Context) error {
 
 	// This is tricky
 	defer s.inviteTx.Terminate() // Terminates INVITE in all cases
-
-	// https://datatracker.ietf.org/doc/html/rfc3261#section-15
-	// However, the callee's UA MUST NOT send a BYE on a confirmed dialog
-	// until it has received an ACK for its 2xx response or until the server
-	// transaction times out.
 	for {
 		state = s.state.Load()
 		if sip.DialogState(state) < sip.DialogStateConfirmed {
@@ -380,17 +397,6 @@ func (s *DialogServerSession) Bye(ctx context.Context) error {
 		}
 
 		break
-	}
-
-	bye := newByeRequestUAS(req, res)
-
-	// Check that we have still match same dialog
-	callidHDR := bye.CallID()
-	newFrom := bye.From()
-	newTo := bye.To()
-	byeID := sip.MakeDialogID(callidHDR.Value(), newFrom.Params["tag"], newTo.Params["tag"])
-	if s.ID != byeID {
-		return fmt.Errorf("non matching ID %q %q", s.ID, byeID)
 	}
 
 	tx, err := s.TransactionRequest(ctx, bye)
@@ -416,40 +422,91 @@ func (s *DialogServerSession) Bye(ctx context.Context) error {
 
 func (dt *DialogServerSession) validateRequest(req *sip.Request) (err error) {
 	// Make sure this is bye for this dialog
-	if req.CSeq().SeqNo != (dt.lastCSeqNo + 1) {
+
+	if req.CSeq().SeqNo < dt.InviteRequest.CSeq().SeqNo {
 		return ErrDialogInvalidCseq
 	}
 	return nil
 }
 
-// newByeRequestUAS generates request for UAS within dialog
-// it does not add VIA header, as this must be handled by transport layer
-func newByeRequestUAS(req *sip.Request, res *sip.Response) *sip.Request {
-	// We must check record route header
-	// https://datatracker.ietf.org/doc/html/rfc2543#section-6.13
-	cont := req.Contact()
-	bye := sip.NewRequest(sip.BYE, cont.Address)
+// DialogServerCache serves as quick way to start building dialog server
+// It is not optimized version and it is recomended that you build own dialog caching
+type DialogServerCache struct {
+	dialogs sync.Map
+	ua      DialogUA
+}
 
-	// Reverse from and to
-	from := res.From()
-	to := res.To()
-	callid := res.CallID()
-
-	newFrom := &sip.FromHeader{
-		DisplayName: to.DisplayName,
-		Address:     to.Address,
-		Params:      to.Params,
+func (s *DialogServerCache) loadDialog(id string) *DialogServerSession {
+	val, ok := s.dialogs.Load(id)
+	if !ok || val == nil {
+		return nil
 	}
 
-	newTo := &sip.ToHeader{
-		DisplayName: from.DisplayName,
-		Address:     from.Address,
-		Params:      from.Params,
+	t := val.(*DialogServerSession)
+	return t
+}
+
+func (s *DialogServerCache) MatchDialogRequest(req *sip.Request) (*DialogServerSession, error) {
+	id, err := sip.DialogIDFromRequestUAS(req)
+	if err != nil {
+		return nil, errors.Join(ErrDialogOutsideDialog, err)
 	}
 
-	bye.AppendHeader(newFrom)
-	bye.AppendHeader(newTo)
-	bye.AppendHeader(callid)
+	dt := s.loadDialog(id)
+	if dt == nil {
+		return nil, ErrDialogDoesNotExists
+	}
+	return dt, nil
+}
 
-	return bye
+// NewDialogServerCache provides simple cache layer for managing UAS dialog
+// Contact hdr is default that is provided for responses.
+// Client is needed for termination dialog session
+// In case handling different transports you should have multiple instances per transport
+//
+// Using DialogUA is now better way for genereting dialogs without caching and giving you as caller whole control of dialog
+func NewDialogServerCache(client *Client, contactHDR sip.ContactHeader) *DialogServerCache {
+	s := &DialogServerCache{
+		dialogs: sync.Map{},
+		ua: DialogUA{
+			Client:     client,
+			ContactHDR: contactHDR,
+		},
+	}
+	return s
+}
+
+// ReadInvite should read from your OnInvite handler for which it creates dialog context
+// You need to use DialogServerSession for all further responses
+// Do not forget to add ReadAck and ReadBye for confirming dialog and terminating
+func (s *DialogServerCache) ReadInvite(req *sip.Request, tx sip.ServerTransaction) (*DialogServerSession, error) {
+	dtx, err := s.ua.ReadInvite(req, tx)
+	if err != nil {
+		return nil, err
+	}
+
+	id := dtx.ID
+	dtx.onClose = func() {
+		s.dialogs.Delete(id)
+	}
+	s.dialogs.Store(id, dtx)
+	return dtx, nil
+}
+
+// ReadAck should read from your OnAck handler
+func (s *DialogServerCache) ReadAck(req *sip.Request, tx sip.ServerTransaction) error {
+	dt, err := s.MatchDialogRequest(req)
+	if err != nil {
+		return err
+	}
+	return dt.ReadAck(req, tx)
+}
+
+// ReadBye should read from your OnBye handler. Returns error if it fails
+func (s *DialogServerCache) ReadBye(req *sip.Request, tx sip.ServerTransaction) error {
+	dt, err := s.MatchDialogRequest(req)
+	if err != nil {
+		return err
+	}
+	return dt.ReadBye(req, tx)
 }

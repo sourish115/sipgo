@@ -1,8 +1,23 @@
 package sip
 
 import (
+	"log/slog"
+	"os"
 	"testing"
 )
+
+func TestMain(m *testing.M) {
+	SIPDebug = os.Getenv("SIP_DEBUG") == "true"
+	TransactionFSMDebug = os.Getenv("TRANSACTION_DEBUG") == "true"
+
+	var lvl slog.Level
+	if err := lvl.UnmarshalText([]byte(os.Getenv("LOG_LEVEL"))); err != nil {
+		lvl = slog.LevelInfo
+	}
+	slog.SetLogLoggerLevel(lvl)
+
+	m.Run()
+}
 
 func BenchmarkGenerateBranch(b *testing.B) {
 	b.ResetTimer()

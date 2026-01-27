@@ -5,15 +5,13 @@ import (
 	"io"
 	"strconv"
 	"strings"
-
-	"github.com/rs/zerolog/log"
 )
 
 const ()
 
 // Header is a single SIP header.
 type Header interface {
-	// Name returns header name.
+	// Name returns underlying header name.
 	Name() string
 	Value() string
 	String() string
@@ -22,6 +20,7 @@ type Header interface {
 
 	// Next() Header
 	headerClone() Header
+	valueStringWrite(w io.StringWriter)
 }
 
 // CopyHeader is internal interface for cloning headers.
@@ -38,6 +37,8 @@ func HeaderClone(h Header) Header {
 type headers struct {
 	headerOrder []Header
 
+	// Here we only need headers that have frequent access.
+	// DO not add any custom headers, or more specific headers
 	via           *ViaHeader
 	from          *FromHeader
 	to            *ToHeader
@@ -49,6 +50,9 @@ type headers struct {
 	route         *RouteHeader
 	recordRoute   *RecordRouteHeader
 	maxForwards   *MaxForwardsHeader
+
+	// CompactHeaders
+	CompactHeaders bool
 }
 
 func (hs *headers) String() string {
@@ -58,11 +62,29 @@ func (hs *headers) String() string {
 }
 
 func (hs *headers) StringWrite(buffer io.StringWriter) {
+	if hs.CompactHeaders {
+		for typeIdx, header := range hs.headerOrder {
+			if typeIdx > 0 {
+				buffer.WriteString("\r\n")
+			}
+
+			// https://www.cs.columbia.edu/sip/compact.html
+			name := header.Name()
+			buffer.WriteString(compactHeaderName(name))
+			buffer.WriteString(": ")
+			header.valueStringWrite(buffer)
+		}
+		buffer.WriteString("\r\n")
+		return
+	}
+
 	for typeIdx, header := range hs.headerOrder {
 		if typeIdx > 0 {
 			buffer.WriteString("\r\n")
 		}
-		header.StringWrite(buffer)
+		buffer.WriteString(header.Name())
+		buffer.WriteString(": ")
+		header.valueStringWrite(buffer)
 	}
 	buffer.WriteString("\r\n")
 }
@@ -200,13 +222,9 @@ func (hs *headers) ReplaceHeader(header Header) {
 	}
 }
 
-// Headers gets some headers.
+// Headers  returns list of headers.
+// NOT THREAD SAFE for updating. Clone them
 func (hs *headers) Headers() []Header {
-	// hdrs := make([]Header, 0)
-	// for _, key := range hs.headerOrder {
-	// 	hdrs = append(hdrs, hs.headers[key])
-	// }
-
 	return hs.headerOrder
 }
 
@@ -283,7 +301,7 @@ func (hs *headers) CloneHeaders() []Header {
 
 // Here are most used headers with quick reference
 
-// CallID returns CallID parsed header or nil if not exists
+// CallID returns underlying CallID parsed header or nil if not exists
 func (hs *headers) CallID() *CallIDHeader {
 	if hs.callid == nil {
 		var h CallIDHeader
@@ -294,7 +312,7 @@ func (hs *headers) CallID() *CallIDHeader {
 	return hs.callid
 }
 
-// Via returns Via parsed header or nil if not exists
+// Via returns underlying Via parsed header or nil if not exists
 func (hs *headers) Via() *ViaHeader {
 	if hs.via == nil {
 		h := &ViaHeader{}
@@ -305,7 +323,7 @@ func (hs *headers) Via() *ViaHeader {
 	return hs.via
 }
 
-// From returns From parsed header or nil if not exists
+// From returns underlying From parsed header or nil if not exists
 func (hs *headers) From() *FromHeader {
 	if hs.from == nil {
 		h := &FromHeader{}
@@ -316,7 +334,7 @@ func (hs *headers) From() *FromHeader {
 	return hs.from
 }
 
-// To returns To parsed header or nil if not exists
+// To returns underlying To parsed header or nil if not exists
 func (hs *headers) To() *ToHeader {
 	if hs.to == nil {
 		h := &ToHeader{}
@@ -327,7 +345,7 @@ func (hs *headers) To() *ToHeader {
 	return hs.to
 }
 
-// CSeq returns CSEQ parsed header or nil if not exists
+// CSeq returns underlying CSEQ parsed header or nil if not exists
 func (hs *headers) CSeq() *CSeqHeader {
 	if hs.cseq == nil {
 		h := &CSeqHeader{}
@@ -338,7 +356,7 @@ func (hs *headers) CSeq() *CSeqHeader {
 	return hs.cseq
 }
 
-// MaxForwards returns Max-Forwards parsed header or nil if not exists
+// MaxForwards returns underlying Max-Forwards parsed header or nil if not exists
 func (hs *headers) MaxForwards() *MaxForwardsHeader {
 	if hs.maxForwards == nil {
 		var h MaxForwardsHeader
@@ -349,7 +367,7 @@ func (hs *headers) MaxForwards() *MaxForwardsHeader {
 	return hs.maxForwards
 }
 
-// ContentLength returns Content-Length parsed header or nil if not exists
+// ContentLength returns underlying Content-Length parsed header or nil if not exists
 func (hs *headers) ContentLength() *ContentLengthHeader {
 	if hs.contentLength == nil {
 		var h ContentLengthHeader
@@ -361,7 +379,7 @@ func (hs *headers) ContentLength() *ContentLengthHeader {
 	return hs.contentLength
 }
 
-// ContentType returns Content-Type parsed header or nil if not exists
+// ContentType returns underlying Content-Type parsed header or nil if not exists
 func (hs *headers) ContentType() *ContentTypeHeader {
 	if hs.contentType == nil {
 		var h ContentTypeHeader
@@ -373,7 +391,7 @@ func (hs *headers) ContentType() *ContentTypeHeader {
 	return hs.contentType
 }
 
-// Contact returns Contact parsed header or nil if not exists
+// Contact returns underlying Contact parsed header or nil if not exists
 func (hs *headers) Contact() *ContactHeader {
 	if hs.contact == nil {
 		h := &ContactHeader{}
@@ -385,7 +403,7 @@ func (hs *headers) Contact() *ContactHeader {
 	return hs.contact
 }
 
-// Route returns Route parsed header or nil if not exists
+// Route returns underlying Route parsed header or nil if not exists
 func (hs *headers) Route() *RouteHeader {
 	if hs.route == nil {
 		h := &RouteHeader{}
@@ -396,7 +414,7 @@ func (hs *headers) Route() *RouteHeader {
 	return hs.route
 }
 
-// RecordRoute returns Record-Route parsed header or nil if not exists
+// RecordRoute returns underlying Record-Route parsed header or nil if not exists
 func (hs *headers) RecordRoute() *RecordRouteHeader {
 	if hs.recordRoute == nil {
 		h := &RecordRouteHeader{}
@@ -405,6 +423,24 @@ func (hs *headers) RecordRoute() *RecordRouteHeader {
 		}
 	}
 	return hs.recordRoute
+}
+
+// ReferTo parses underlying Refer-To header or nil if not exists
+func (hs *headers) ReferTo() *ReferToHeader {
+	h := &ReferToHeader{}
+	if parseHeaderLazy(hs, parseReferToHeader, []string{"refer-to"}, h) {
+		return h
+	}
+	return nil
+}
+
+// ReferredBy parses underlying Referred-By header or nil if not exists
+func (hs *headers) ReferredBy() *ReferredByHeader {
+	h := &ReferredByHeader{}
+	if parseHeaderLazy(hs, parseReferredByHeader, []string{"referred-by"}, h) {
+		return h
+	}
+	return nil
 }
 
 // NewHeader creates generic type of header
@@ -432,6 +468,10 @@ func (h *genericHeader) String() string {
 func (h *genericHeader) StringWrite(buffer io.StringWriter) {
 	buffer.WriteString(h.Name())
 	buffer.WriteString(": ")
+	buffer.WriteString(h.Value())
+}
+
+func (h *genericHeader) valueStringWrite(buffer io.StringWriter) {
 	buffer.WriteString(h.Value())
 }
 
@@ -473,18 +513,18 @@ func (h *ToHeader) String() string {
 func (h *ToHeader) StringWrite(buffer io.StringWriter) {
 	buffer.WriteString(h.Name())
 	buffer.WriteString(": ")
-	h.ValueStringWrite(buffer)
+	h.valueStringWrite(buffer)
 }
 
 func (h *ToHeader) Name() string { return "To" }
 
 func (h *ToHeader) Value() string {
 	var buffer strings.Builder
-	h.ValueStringWrite(&buffer)
+	h.valueStringWrite(&buffer)
 	return buffer.String()
 }
 
-func (h *ToHeader) ValueStringWrite(buffer io.StringWriter) {
+func (h *ToHeader) valueStringWrite(buffer io.StringWriter) {
 	if h.DisplayName != "" {
 		buffer.WriteString("\"")
 		buffer.WriteString(h.DisplayName)
@@ -504,8 +544,12 @@ func (h *ToHeader) ValueStringWrite(buffer io.StringWriter) {
 	}
 }
 
-func (header *ToHeader) Next() Header {
-	return nil
+func (h *ToHeader) AsFrom() FromHeader {
+	return FromHeader{
+		Address:     *h.Address.Clone(),
+		Params:      h.Params.Clone(),
+		DisplayName: h.DisplayName,
+	}
 }
 
 // Copy the header.
@@ -547,18 +591,18 @@ func (h *FromHeader) String() string {
 func (h *FromHeader) StringWrite(buffer io.StringWriter) {
 	buffer.WriteString(h.Name())
 	buffer.WriteString(": ")
-	h.ValueStringWrite(buffer)
+	h.valueStringWrite(buffer)
 }
 
 func (h *FromHeader) Name() string { return "From" }
 
 func (h *FromHeader) Value() string {
 	var buffer strings.Builder
-	h.ValueStringWrite(&buffer)
+	h.valueStringWrite(&buffer)
 	return buffer.String()
 }
 
-func (h *FromHeader) ValueStringWrite(buffer io.StringWriter) {
+func (h *FromHeader) valueStringWrite(buffer io.StringWriter) {
 	if h.DisplayName != "" {
 		buffer.WriteString("\"")
 		buffer.WriteString(h.DisplayName)
@@ -596,8 +640,12 @@ func (h *FromHeader) headerClone() Header {
 	return newFrom
 }
 
-func (header *FromHeader) Next() Header {
-	return nil
+func (h *FromHeader) AsTo() ToHeader {
+	return ToHeader{
+		Address:     *h.Address.Clone(),
+		Params:      h.Params.Clone(),
+		DisplayName: h.DisplayName,
+	}
 }
 
 // ContactHeader is Contact header representation
@@ -618,18 +666,18 @@ func (h *ContactHeader) String() string {
 func (h *ContactHeader) StringWrite(buffer io.StringWriter) {
 	buffer.WriteString(h.Name())
 	buffer.WriteString(": ")
-	h.valueWrite(buffer)
+	h.valueStringWrite(buffer)
 }
 
 func (h *ContactHeader) Name() string { return "Contact" }
 
 func (h *ContactHeader) Value() string {
 	var buffer strings.Builder
-	h.valueWrite(&buffer)
+	h.valueStringWrite(&buffer)
 	return buffer.String()
 }
 
-func (h *ContactHeader) valueWrite(buffer io.StringWriter) {
+func (h *ContactHeader) valueStringWrite(buffer io.StringWriter) {
 
 	switch h.Address.Wildcard {
 	case true:
@@ -695,6 +743,10 @@ func (h *CallIDHeader) StringWrite(buffer io.StringWriter) {
 	buffer.WriteString(h.Value())
 }
 
+func (h *CallIDHeader) valueStringWrite(buffer io.StringWriter) {
+	buffer.WriteString(h.Value())
+}
+
 func (h *CallIDHeader) Name() string { return "Call-ID" }
 
 func (h *CallIDHeader) Value() string { return string(*h) }
@@ -718,7 +770,7 @@ func (h *CSeqHeader) String() string {
 func (h *CSeqHeader) StringWrite(buffer io.StringWriter) {
 	buffer.WriteString(h.Name())
 	buffer.WriteString(": ")
-	h.ValueStringWrite(buffer)
+	h.valueStringWrite(buffer)
 }
 
 func (h *CSeqHeader) Name() string { return "CSeq" }
@@ -727,7 +779,7 @@ func (h *CSeqHeader) Value() string {
 	return fmt.Sprintf("%d %s", h.SeqNo, h.MethodName)
 }
 
-func (h *CSeqHeader) ValueStringWrite(buffer io.StringWriter) {
+func (h *CSeqHeader) valueStringWrite(buffer io.StringWriter) {
 	buffer.WriteString(strconv.Itoa(int(h.SeqNo)))
 	buffer.WriteString(" ")
 	buffer.WriteString(string(h.MethodName))
@@ -760,6 +812,10 @@ func (h *MaxForwardsHeader) StringWrite(buffer io.StringWriter) {
 	buffer.WriteString(h.Value())
 }
 
+func (h *MaxForwardsHeader) valueStringWrite(buffer io.StringWriter) {
+	buffer.WriteString(h.Value())
+}
+
 func (h *MaxForwardsHeader) Name() string { return "Max-Forwards" }
 
 func (h *MaxForwardsHeader) Value() string { return strconv.Itoa(int(*h)) }
@@ -787,6 +843,10 @@ func (h *ExpiresHeader) StringWrite(buffer io.StringWriter) {
 	buffer.WriteString(h.Value())
 }
 
+func (h *ExpiresHeader) valueStringWrite(buffer io.StringWriter) {
+	buffer.WriteString(h.Value())
+}
+
 func (h *ExpiresHeader) Name() string { return "Expires" }
 
 func (h ExpiresHeader) Value() string { return strconv.Itoa(int(h)) }
@@ -808,6 +868,10 @@ func (h ContentLengthHeader) StringWrite(buffer io.StringWriter) {
 	buffer.WriteString(h.Value())
 }
 
+func (h *ContentLengthHeader) valueStringWrite(buffer io.StringWriter) {
+	buffer.WriteString(h.Value())
+}
+
 func (h *ContentLengthHeader) Name() string { return "Content-Length" }
 
 func (h ContentLengthHeader) Value() string { return strconv.Itoa(int(h)) }
@@ -815,17 +879,15 @@ func (h ContentLengthHeader) Value() string { return strconv.Itoa(int(h)) }
 func (h *ContentLengthHeader) headerClone() Header { return h }
 
 // ViaHeader is Via header representation.
-// It can be linked list of multiple via if they are part of one header
 type ViaHeader struct {
 	// E.g. 'SIP'.
 	ProtocolName string
 	// E.g. '2.0'.
 	ProtocolVersion string
 	Transport       string
-	// TODO consider changing Host Port as struct Addr from transport
-	Host   string
-	Port   int // This is optional
-	Params HeaderParams
+	Host            string
+	Port            int // This is optional
+	Params          HeaderParams
 }
 
 func (hop *ViaHeader) SentBy() string {
@@ -854,18 +916,18 @@ func (h *ViaHeader) Name() string { return "Via" }
 
 func (h *ViaHeader) Value() string {
 	var buffer strings.Builder
-	h.ValueStringWrite(&buffer)
+	h.valueStringWrite(&buffer)
 	return buffer.String()
 }
 
-func (h *ViaHeader) ValueStringWrite(buffer io.StringWriter) {
+func (h *ViaHeader) valueStringWrite(buffer io.StringWriter) {
 	buffer.WriteString(h.ProtocolName)
 	buffer.WriteString("/")
 	buffer.WriteString(h.ProtocolVersion)
 	buffer.WriteString("/")
 	buffer.WriteString(h.Transport)
 	buffer.WriteString(" ")
-	buffer.WriteString(h.Host)
+	buffer.WriteString(uriIP(h.Host))
 
 	if h.Port > 0 {
 		buffer.WriteString(":")
@@ -915,7 +977,10 @@ func (h *ContentTypeHeader) StringWrite(buffer io.StringWriter) {
 	buffer.WriteString(h.Value())
 }
 
-// func (h **ContentTypeHeader) Name() string { return "Content-Type" }
+func (h *ContentTypeHeader) valueStringWrite(buffer io.StringWriter) {
+	buffer.WriteString(h.Value())
+}
+
 func (h *ContentTypeHeader) Name() string { return "Content-Type" }
 
 func (h *ContentTypeHeader) Value() string { return string(*h) }
@@ -931,11 +996,11 @@ func (h *RouteHeader) Name() string { return "Route" }
 
 func (h *RouteHeader) Value() string {
 	var buffer strings.Builder
-	h.ValueStringWrite(&buffer)
+	h.valueStringWrite(&buffer)
 	return buffer.String()
 }
 
-func (h *RouteHeader) ValueStringWrite(buffer io.StringWriter) {
+func (h *RouteHeader) valueStringWrite(buffer io.StringWriter) {
 	buffer.WriteString("<")
 	h.Address.StringWrite(buffer)
 	buffer.WriteString(">")
@@ -950,7 +1015,7 @@ func (h *RouteHeader) String() string {
 func (h *RouteHeader) StringWrite(buffer io.StringWriter) {
 	buffer.WriteString(h.Name())
 	buffer.WriteString(": ")
-	h.ValueStringWrite(buffer)
+	h.valueStringWrite(buffer)
 }
 
 func (h *RouteHeader) headerClone() Header {
@@ -973,11 +1038,11 @@ func (h *RecordRouteHeader) Name() string { return "Record-Route" }
 
 func (h *RecordRouteHeader) Value() string {
 	var buffer strings.Builder
-	h.ValueStringWrite(&buffer)
+	h.valueStringWrite(&buffer)
 	return buffer.String()
 }
 
-func (h *RecordRouteHeader) ValueStringWrite(buffer io.StringWriter) {
+func (h *RecordRouteHeader) valueStringWrite(buffer io.StringWriter) {
 	buffer.WriteString("<")
 	h.Address.StringWrite(buffer)
 	buffer.WriteString(">")
@@ -992,7 +1057,7 @@ func (h *RecordRouteHeader) String() string {
 func (h *RecordRouteHeader) StringWrite(buffer io.StringWriter) {
 	buffer.WriteString(h.Name())
 	buffer.WriteString(": ")
-	h.ValueStringWrite(buffer)
+	h.valueStringWrite(buffer)
 }
 
 func (h *RecordRouteHeader) headerClone() Header {
@@ -1004,6 +1069,107 @@ func (h *RecordRouteHeader) Clone() *RecordRouteHeader {
 		Address: *h.Address.Clone(),
 	}
 	return newRoute
+}
+
+// ReferToHeader is Refer-To header representation.
+type ReferToHeader struct {
+	Address Uri
+}
+
+func (h *ReferToHeader) Name() string { return "Refer-To" }
+
+func (h *ReferToHeader) Value() string {
+	var buffer strings.Builder
+	h.valueStringWrite(&buffer)
+	return buffer.String()
+}
+
+func (h *ReferToHeader) valueStringWrite(buffer io.StringWriter) {
+	buffer.WriteString("<")
+	h.Address.StringWrite(buffer)
+	buffer.WriteString(">")
+}
+
+func (h *ReferToHeader) String() string {
+	var buffer strings.Builder
+	h.StringWrite(&buffer)
+	return buffer.String()
+}
+
+func (h *ReferToHeader) StringWrite(buffer io.StringWriter) {
+	buffer.WriteString(h.Name())
+	buffer.WriteString(": ")
+	h.valueStringWrite(buffer)
+}
+
+func (h *ReferToHeader) headerClone() Header {
+	return h.Clone()
+}
+
+func (h *ReferToHeader) Clone() *ReferToHeader {
+	newTarget := &ReferToHeader{
+		Address: *h.Address.Clone(),
+	}
+	return newTarget
+}
+
+// ReferredByHeader is Referred-By header representation.
+type ReferredByHeader struct {
+	DisplayName string
+	Address     Uri
+	Params      HeaderParams
+}
+
+func (h *ReferredByHeader) Name() string { return "Referred-By" }
+
+func (h *ReferredByHeader) Value() string {
+	var buffer strings.Builder
+	h.valueStringWrite(&buffer)
+	return buffer.String()
+}
+
+func (h *ReferredByHeader) valueStringWrite(buffer io.StringWriter) {
+	if h.DisplayName != "" {
+		buffer.WriteString("\"")
+		buffer.WriteString(h.DisplayName)
+		buffer.WriteString("\" ")
+	}
+
+	buffer.WriteString("<")
+	h.Address.StringWrite(buffer)
+	buffer.WriteString(">")
+
+	if h.Params != nil && h.Params.Length() > 0 {
+		buffer.WriteString(";")
+		h.Params.ToStringWrite(';', buffer)
+	}
+}
+
+func (h *ReferredByHeader) String() string {
+	var buffer strings.Builder
+	h.StringWrite(&buffer)
+	return buffer.String()
+}
+
+func (h *ReferredByHeader) StringWrite(buffer io.StringWriter) {
+	buffer.WriteString(h.Name())
+	buffer.WriteString(": ")
+	h.valueStringWrite(buffer)
+}
+
+func (h *ReferredByHeader) headerClone() Header {
+	return h.Clone()
+}
+
+func (h *ReferredByHeader) Clone() *ReferredByHeader {
+	newTarget := &ReferredByHeader{
+		DisplayName: h.DisplayName,
+		Address:     *h.Address.Clone(),
+	}
+	if h.Params != nil {
+		newTarget.Params = h.Params.Clone()
+	}
+	return newTarget
 }
 
 // Copy all headers of one type from one message to another.
@@ -1027,10 +1193,48 @@ func parseHeaderLazy[T any, HP headerPointerReceiver[T]](hs *headers, f func(hea
 		}
 
 		if err := f(hdr.Value(), h); err != nil {
-			log.Debug().Err(err).Msgf("Lazy header parsing of %s failed", hdr.Name())
+			DefaultLogger().Debug("Lazy header parsing failed", "header", hdr.Name(), "error", err)
 			return false
 		}
 		return true
 	}
 	return false
+}
+
+func compactHeaderName(full string) string {
+	switch full {
+	case "Via":
+		return "v"
+	case "From":
+		return "f"
+	case "To":
+		return "t"
+	case "Call-ID":
+		return "i"
+	case "Content-Type":
+		return "c"
+	case "Content-Length":
+		return "l"
+	case "Contact":
+		return "m"
+	case "Refer-To":
+		return "r"
+	case "Content-Encoding":
+		return "e"
+	case "Accept-Contact":
+		return "a"
+	case "Referred-By":
+		return "b"
+	case "Supported":
+		return "k"
+	case "Event":
+		return "o"
+	case "Subject":
+		return "s"
+	case "Allow-Events":
+		return "u"
+
+	default:
+		return full
+	}
 }

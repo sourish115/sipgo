@@ -1,20 +1,24 @@
 package siptest
 
 import (
-	"github.com/emiago/sipgo/sip"
+	"log/slog"
 
-	"github.com/rs/zerolog/log"
+	"github.com/emiago/sipgo/sip"
 )
 
-func NewServerTxRecorder(req *sip.Request) *ServerTxRecorder {
-	// stx := transaction.NewServerTx()
+// ServerTxRecorder wraps server transactions
+type ServerTxRecorder struct {
+	*sip.ServerTx
+	c *connRecorder
+}
 
-	key, err := sip.MakeServerTxKey(req)
+func NewServerTxRecorder(req *sip.Request) *ServerTxRecorder {
+	key, err := sip.ServerTxKeyMake(req)
 	if err != nil {
 		panic(err)
 	}
 	conn := newConnRecorder()
-	stx := sip.NewServerTx(key, req, conn, log.Logger)
+	stx := sip.NewServerTx(key, req, conn, slog.Default())
 	if err := stx.Init(); err != nil {
 		panic(err)
 	}
@@ -22,12 +26,6 @@ func NewServerTxRecorder(req *sip.Request) *ServerTxRecorder {
 		stx,
 		conn,
 	}
-}
-
-// ServerTxRecorder wraps server transactions
-type ServerTxRecorder struct {
-	*sip.ServerTx
-	c *connRecorder
 }
 
 // Result returns sip response. Can be nil if none was processed
@@ -66,5 +64,3 @@ func (r *ServerTxRecorder) Result() []*sip.Response {
 // func (r *ServerTxRecorder) Cancels() <-chan *sip.Request {
 
 // }
-
-// var _ sip.ServerTransaction = &ServerTxRecorder{}

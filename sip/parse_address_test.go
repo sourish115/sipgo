@@ -25,7 +25,7 @@ func TestParseAddressValue(t *testing.T) {
 		assert.Equal(t, "password", uri.Password)
 		assert.Equal(t, "127.0.0.1", uri.Host)
 		assert.Equal(t, 5060, uri.Port)
-		assert.Equal(t, true, uri.Encrypted)
+		assert.Equal(t, true, uri.IsEncrypted())
 		assert.Equal(t, false, uri.Wildcard)
 
 		user, ok := uri.UriParams.Get("user")
@@ -45,7 +45,21 @@ func TestParseAddressValue(t *testing.T) {
 		assert.Equal(t, "", displayName)
 		assert.Equal(t, "1215174826", uri.User)
 		assert.Equal(t, "222.222.222.222", uri.Host)
-		assert.Equal(t, false, uri.Encrypted)
+		assert.Equal(t, false, uri.IsEncrypted())
+	})
+
+	t.Run("nil uri params", func(t *testing.T) {
+		address := "sip:1215174826@222.222.222.222:5066"
+		uri := Uri{}
+		params := NewParams()
+		displayName, err := ParseAddressValue(address, &uri, params)
+		require.NoError(t, err)
+
+		assert.Equal(t, "", displayName)
+		assert.Equal(t, "1215174826", uri.User)
+		assert.Equal(t, "222.222.222.222", uri.Host)
+		assert.Equal(t, HeaderParams{}, uri.UriParams)
+		assert.Equal(t, false, uri.IsEncrypted())
 	})
 
 	t.Run("wildcard", func(t *testing.T) {
@@ -59,6 +73,32 @@ func TestParseAddressValue(t *testing.T) {
 		assert.Equal(t, "*", uri.Host)
 		assert.Equal(t, true, uri.Wildcard)
 	})
+
+	t.Run("quoted-pairs", func(t *testing.T) {
+		address := "\"!\\\"#$%&/'()*+-.,0123456789:;<=>? @ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\\\]^_'abcdefghijklmnopqrstuvwxyz{|}\" <sip:bob@127.0.0.1:5060;user=phone>;tag=1234"
+		uri := Uri{}
+		params := NewParams()
+		displayName, err := ParseAddressValue(address, &uri, params)
+		require.NoError(t, err)
+
+		assert.Equal(t, "sip:bob@127.0.0.1:5060;user=phone", uri.String())
+		assert.Equal(t, "tag=1234", params.String())
+
+		assert.Equal(t, "!\\\"#$%&/'()*+-.,0123456789:;<=>? @ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\\\]^_'abcdefghijklmnopqrstuvwxyz{|}", displayName)
+		assert.Equal(t, "bob", uri.User)
+		assert.Equal(t, "", uri.Password)
+		assert.Equal(t, "127.0.0.1", uri.Host)
+		assert.Equal(t, 5060, uri.Port)
+		assert.Equal(t, false, uri.IsEncrypted())
+		assert.Equal(t, false, uri.Wildcard)
+
+		user, ok := uri.UriParams.Get("user")
+		assert.True(t, ok)
+		assert.Equal(t, 1, uri.UriParams.Length())
+		assert.Equal(t, "phone", user)
+
+	})
+
 }
 
 func TestParseAddressBad(t *testing.T) {
@@ -71,14 +111,6 @@ func TestParseAddressBad(t *testing.T) {
 		require.Error(t, err)
 	})
 }
-
-// TODO
-// func TestParseAddressMultiline(t *testing.T) {
-// contact:
-// 	+`Contact: "Mr. Watson" <sip:watson@worcester.bell-telephone.com>
-// 	;q=0.7; expires=3600,
-// 	"Mr. Watson" <mailto:watson@bell-telephone.com> ;q=0.1`
-// }
 
 func BenchmarkParseAddress(b *testing.B) {
 	address := "\"Bob\" <sips:bob:password@127.0.0.1:5060;user=phone>;tag=1234"

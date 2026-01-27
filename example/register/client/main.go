@@ -4,56 +4,48 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 
 	"github.com/icholy/digest"
 )
 
 func main() {
-	inter := flag.String("h", "localhost", "My interface ip or hostname")
+	inter := flag.String("h", "127.0.0.1", "My interface ip or hostname")
 	dst := flag.String("srv", "127.0.0.1:5060", "Destination")
 	tran := flag.String("t", "udp", "Transport")
+	user := flag.String("ua", "alice", "SIP Username")
 	username := flag.String("u", "alice", "SIP Username")
 	password := flag.String("p", "alice", "Password")
 	flag.Parse()
 
 	// Make SIP Debugging available
 	sip.SIPDebug = os.Getenv("SIP_DEBUG") != ""
-
-	zerolog.TimeFieldFormat = zerolog.TimeFormatUnixMicro
-	log.Logger = zerolog.New(zerolog.ConsoleWriter{
-		Out:        os.Stdout,
-		TimeFormat: time.StampMicro,
-	}).With().Timestamp().Logger().Level(zerolog.InfoLevel)
-
-	if lvl, err := zerolog.ParseLevel(os.Getenv("LOG_LEVEL")); err == nil && lvl != zerolog.NoLevel {
-		log.Logger = log.Logger.Level(lvl)
-	}
+	log := getLogger()
 
 	// Setup UAC
 	ua, err := sipgo.NewUA(
-		sipgo.WithUserAgent(*username),
+		sipgo.WithUserAgent(*user),
 	)
 	if err != nil {
-		log.Fatal().Err(err).Msg("Fail to setup user agent")
+		log.Error("Fail to setup user agent", "error", err)
+		return
 	}
 
 	client, err := sipgo.NewClient(ua, sipgo.WithClientHostname(*inter))
 	if err != nil {
-		log.Fatal().Err(err).Msg("Fail to setup client handle")
+		log.Error("Fail to setup client handle", "error", err)
+		return
 	}
 	defer client.Close()
 
 	// Create basic REGISTER request structure
 	recipient := sip.Uri{}
-	sip.ParseUri(fmt.Sprintf("sip:%s@%s", *username, *dst), &recipient)
+	sip.ParseUri(fmt.Sprintf("sip:%s@%s", *user, *dst), &recipient)
 	req := sip.NewRequest(sip.REGISTER, recipient)
 	req.AppendHeader(
 		sip.NewHeader("Contact", fmt.Sprintf("<sip:%s@%s>", *username, *inter)),
@@ -62,26 +54,29 @@ func main() {
 
 	// Send request and parse response
 	// req.SetDestination(*dst)
-	log.Info().Msg(req.StartLine())
+	log.Info(req.StartLine())
 	ctx := context.Background()
-	tx, err := client.TransactionRequest(ctx, req)
+	tx, err := client.TransactionRequest(ctx, req, sipgo.ClientRequestRegisterBuild)
 	if err != nil {
-		log.Fatal().Err(err).Msg("Fail to create transaction")
+		log.Error("Fail to create transaction", "error", err)
+		return
 	}
 	defer tx.Terminate()
 
 	res, err := getResponse(tx)
 	if err != nil {
-		log.Fatal().Err(err).Msg("Fail to get response")
+		log.Error("Fail to get response", "error", err)
+		return
 	}
 
-	log.Info().Int("status", int(res.StatusCode)).Msg("Received status")
+	log.Info("Received status", "status", int(res.StatusCode))
 	if res.StatusCode == 401 {
 		// Get WwW-Authenticate
 		wwwAuth := res.GetHeader("WWW-Authenticate")
 		chal, err := digest.ParseChallenge(wwwAuth.Value())
 		if err != nil {
-			log.Fatal().Str("wwwauth", wwwAuth.Value()).Err(err).Msg("Fail to parse challenge")
+			log.Error("Fail to parse challenge", "error", err, "wwwauth", wwwAuth.Value)
+			return
 		}
 
 		// Reply with digest
@@ -97,23 +92,26 @@ func main() {
 		newReq.AppendHeader(sip.NewHeader("Authorization", cred.String()))
 
 		ctx := context.Background()
-		tx, err := client.TransactionRequest(ctx, newReq, sipgo.ClientRequestAddVia)
+		tx, err := client.TransactionRequest(ctx, newReq, sipgo.ClientRequestIncreaseCSEQ, sipgo.ClientRequestAddVia)
 		if err != nil {
-			log.Fatal().Err(err).Msg("Fail to create transaction")
+			log.Error("Fail to create transaction", "error", err)
+			return
 		}
 		defer tx.Terminate()
 
 		res, err = getResponse(tx)
 		if err != nil {
-			log.Fatal().Err(err).Msg("Fail to get response")
+			log.Error("Fail to get response", "error", err)
+			return
 		}
 	}
 
 	if res.StatusCode != 200 {
-		log.Fatal().Msg("Fail to register")
+		log.Error("Fail to register")
+		return
 	}
 
-	log.Info().Msg("Client registered")
+	log.Info("Client registered")
 }
 
 func getResponse(tx sip.ClientTransaction) (*sip.Response, error) {
@@ -123,4 +121,22 @@ func getResponse(tx sip.ClientTransaction) (*sip.Response, error) {
 	case res := <-tx.Responses():
 		return res, nil
 	}
+}
+
+func getLogger() *slog.Logger {
+	// zerolog.TimeFieldFormat = zerolog.TimeFormatUnixMicro
+	// zlog := zerolog.New(zerolog.ConsoleWriter{
+	// 	Out:        os.Stdout,
+	// 	TimeFormat: time.StampMicro,
+	// }).With().Timestamp().Logger().Level(zerolog.InfoLevel)
+
+	// logger := slog.New(slogzerolog.Option{Level: lvl, Logger: &zlog}.NewZerologHandler())
+	// h := slog.NewTextHandler(os.Stdin, &slog.HandlerOptions{Level: lvl})
+	// slog.SetDefault(slog.New(h))
+	var lvl slog.Level
+	if err := lvl.UnmarshalText([]byte(os.Getenv("LOG_LEVEL"))); err != nil {
+		lvl = slog.LevelInfo
+	}
+	slog.SetLogLoggerLevel(lvl)
+	return slog.Default()
 }

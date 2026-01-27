@@ -1,12 +1,11 @@
-// Originally forked from https://github.com/ghettovoice/gosip by @ghetovoice
 package sip
 
 import (
-	"fmt"
 	"time"
 )
 
 // TODO v2
+// Originally forked from https://github.com/ghettovoice/gosip by @ghetovoice
 // Better design could by passing some context through fsm state
 // Context could carry either response or error
 
@@ -27,6 +26,8 @@ func (tx *ServerTx) inviteStateProcceeding(s fsmInput) fsmInput {
 		tx.fsmState, spinfn = tx.inviteStateCompleted, tx.actRespondComplete
 	case server_input_transport_err:
 		tx.fsmState, spinfn = tx.inviteStateTerminated, tx.actTransErr
+	default:
+		return FsmInputNone
 	}
 
 	return spinfn()
@@ -72,6 +73,10 @@ func (tx *ServerTx) inviteStateAccepted(s fsmInput) fsmInput {
 	case server_input_ack:
 		tx.fsmState, spinfn = tx.inviteStateAccepted, tx.actPassupAck
 	case server_input_user_2xx:
+		// The server transaction MUST NOT generate 2xx retransmissions on its
+		// own.  Any retransmission of the 2xx response passed from the TU to
+		// the transaction while in the "Accepted" state MUST be passed to the
+		// transport layer for transmission.
 		tx.fsmState, spinfn = tx.inviteStateAccepted, tx.actRespond
 	case server_input_timer_l:
 		tx.fsmState, spinfn = tx.inviteStateTerminated, tx.actDelete
@@ -230,12 +235,14 @@ func (tx *ServerTx) actFinal() fsmInput {
 		return server_input_transport_err
 	}
 
+	// https://datatracker.ietf.org/doc/html/rfc3261#section-17.2.2
+	//  When the server transaction enters the "Completed" state, it MUST set
+	//    Timer J to fire in 64*T1 seconds for unreliable transports, and zero
+	//    seconds for reliable transports.
 	tx.mu.Lock()
-	tx.timer_j = time.AfterFunc(Timer_J, func() {
-		// tx.Log().Trace("timer_j fired")
+	tx.timer_j = time.AfterFunc(tx.timer_j_time, func() {
 		tx.spinFsm(server_input_timer_j)
 	})
-
 	tx.mu.Unlock()
 
 	return FsmInputNone
@@ -243,35 +250,22 @@ func (tx *ServerTx) actFinal() fsmInput {
 
 // Inform user of transport error
 func (tx *ServerTx) actTransErr() fsmInput {
-	tx.log.Debug().Err(tx.fsmErr).Msg("Transport error. Transaction will terminate")
+	tx.log.Debug("Transport error. Transaction will terminate", "fsmError", tx.fsmErr, "tx", tx.Key())
 	return server_input_delete
 }
 
-// Inform user of timeout error
+// Inform user of timeout fsmError
 func (tx *ServerTx) actTimeout() fsmInput {
-	tx.log.Debug().Err(tx.fsmErr).Msg("Timed out. Transaction will terminate")
+	tx.log.Debug("Timed out. Transaction will terminate", "fsmError", tx.fsmErr, "tx", tx.Key())
 	return server_input_delete
 }
 
 // Just delete the transaction.
 func (tx *ServerTx) actDelete() fsmInput {
-	tx.delete()
-
-	return FsmInputNone
-}
-
-// Send response and delete the transaction.
-func (tx *ServerTx) actRespondDelete() fsmInput {
-	// tx.Log().Debug("actRespondDelete")
-	tx.delete()
-	err := tx.conn.WriteMsg(tx.fsmResp)
-
-	if err != nil {
-		tx.fsmErr = wrapTransportError(err)
-		tx.log.Debug().Err(err).Msg("fail to actRespondDelete")
-		return server_input_transport_err
+	if tx.fsmErr == nil {
+		tx.fsmErr = ErrTransactionTerminated
 	}
-
+	tx.delete(tx.fsmErr)
 	return FsmInputNone
 }
 
@@ -288,8 +282,8 @@ func (tx *ServerTx) actConfirm() fsmInput {
 		tx.timer_h = nil
 	}
 
-	tx.timer_i = time.AfterFunc(Timer_I, func() {
-		// tx.Log().Trace("timer_i fired")
+	// If transport is reliable this will be 0 and fire imediately
+	tx.timer_i = time.AfterFunc(tx.timer_i_time, func() {
 		tx.spinFsm(server_input_timer_i)
 	})
 
@@ -300,8 +294,25 @@ func (tx *ServerTx) actConfirm() fsmInput {
 }
 
 func (tx *ServerTx) actCancel() fsmInput {
-	tx.passCancel()
-	return FsmInputNone
+	r := tx.fsmCancel
+
+	if r == nil {
+		return FsmInputNone
+	}
+
+	tx.log.Debug("Passing 487 on CANCEL", "tx", tx.Key())
+	tx.fsmResp = NewResponseFromRequest(tx.origin, StatusRequestTerminated, "Request Terminated", nil)
+	tx.fsmErr = ErrTransactionCanceled // For now only informative
+
+	// Check is there some listener on cancel
+	tx.mu.Lock()
+	onCancel := tx.onCancel
+	tx.mu.Unlock()
+	if onCancel != nil {
+		onCancel(r)
+	}
+
+	return server_input_user_300_plus
 }
 
 func (tx *ServerTx) passAck() {
@@ -313,26 +324,18 @@ func (tx *ServerTx) passAck() {
 	tx.ackSendAsync(r)
 }
 
-func (tx *ServerTx) passCancel() {
-	r := tx.fsmCancel
-
-	if r == nil {
-		return
-	}
-	tx.cancelSendAsync(r)
-}
-
 func (tx *ServerTx) passResp() error {
 	lastResp := tx.fsmResp
 
 	if lastResp == nil {
-		return fmt.Errorf("none response")
+		// We may have received multiple request but without any response
+		// placed yet in transaction
+		return nil
 	}
 
-	// tx.Log().Debug("actFinal")
 	err := tx.conn.WriteMsg(lastResp)
 	if err != nil {
-		tx.log.Debug().Err(err).Str("res", lastResp.StartLine()).Msg("fail to pass response")
+		tx.log.Debug("fail to pass response", "error", err, "res", lastResp.StartLine(), "tx", tx.Key())
 		tx.fsmErr = wrapTransportError(err)
 		return err
 	}

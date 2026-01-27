@@ -1,14 +1,16 @@
 package sip
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/rs/zerolog"
 )
 
 var (
@@ -71,8 +73,10 @@ func SetTimers(t1, t2, t4 time.Duration) {
 var (
 	// Transaction Layer Errors can be detected and handled with different response on caller side
 	// https://www.rfc-editor.org/rfc/rfc3261#section-8.1.3.1
-	ErrTransactionTimeout   = errors.New("transaction timeout")
-	ErrTransactionTransport = errors.New("transaction transport error")
+	ErrTransactionTimeout    = errors.New("transaction timeout")
+	ErrTransactionTransport  = errors.New("transaction transport error")
+	ErrTransactionCanceled   = errors.New("transaction canceled")
+	ErrTransactionTerminated = errors.New("transaction terminated")
 )
 
 func wrapTransportError(err error) error {
@@ -86,9 +90,19 @@ func wrapTimeoutError(err error) error {
 type Transaction interface {
 	// Terminate will terminate transaction
 	Terminate()
+
+	// OnTerminate can be registered to be called when transaction terminates.
+	// It is alternative to tx.Done where you avoid creating more goroutines.
+	// It returns false if transaction already terminated.
+	// NOTE: calling tx methods inside this func can DEADLOCK
+	//
+	// Experimental
+	OnTerminate(f FnTxTerminate) bool
+
 	// Done when transaction fsm terminates. Can be called multiple times
 	Done() <-chan struct{}
-	// Last error. Useful to check when transaction terminates
+
+	// Err that stopped transaction. Useful to check when transaction terminates
 	Err() error
 }
 
@@ -98,28 +112,50 @@ type ServerTransaction interface {
 	// Respond sends response. It is expected that is prebuilt with correct headers
 	// Use NewResponseFromRequest to build response
 	Respond(res *Response) error
+	// Acks returns ACK during transaction.
 	Acks() <-chan *Request
-	// Cancels is triggered when transaction is canceled, that is SIP CANCEL is received for transaction.
-	Cancels() <-chan *Request
+
+	// OnCancel will be fired when CANCEL request is received
+	// It allows you to detect CANCEL request, which will be followed by termination.
+	// It returns false in case transaction already terminated
+	// NOTE: You must not block here too long. In that case fire go routine.
+	//
+	// Experimental
+	OnCancel(f FnTxCancel) bool
+}
+
+// ServerTransactionContext creates server transaction cancelation via context.Context
+// This is useful if you want to pass this on underhood APIs
+// Should not be called more than once per transaction
+func ServerTransactionContext(tx ServerTransaction) context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := tx.OnTerminate(func(key string, err error) {
+		cancel()
+	})
+	if done {
+		cancel()
+	}
+	return ctx
 }
 
 type ClientTransaction interface {
 	Transaction
 	// Responses returns channel with all responses for transaction
 	Responses() <-chan *Response
-	// Cancel sends cancel request
-	// TODO: Do we need context passing here?
-	Cancel() error
+
+	// Register response retransmission hook.
+	OnRetransmission(f FnTxResponse) bool
 }
 
 type baseTx struct {
-	key string
+	mu sync.Mutex
 
+	key    string
 	origin *Request
-	// tpl    *transport.Layer
 
-	conn Connection
-	done chan struct{}
+	conn   Connection
+	done   chan struct{}
+	closed bool
 
 	//State machine control
 	fsmMu    sync.Mutex
@@ -133,7 +169,7 @@ type baseTx struct {
 	fsmAck    *Request
 	fsmCancel *Request
 
-	log         zerolog.Logger
+	log         *slog.Logger
 	onTerminate FnTxTerminate
 }
 
@@ -157,8 +193,30 @@ func (tx *baseTx) Done() <-chan struct{} {
 	return tx.done
 }
 
-func (tx *baseTx) OnTerminate(f FnTxTerminate) {
+// OnTerminate is experimental
+// Callback function can not call any fsm related functions as it will cause deadlock like.
+// Err must not be called,instead error is passed
+func (tx *baseTx) OnTerminate(f FnTxTerminate) bool {
+	tx.mu.Lock()
+	select {
+	case <-tx.done:
+		tx.mu.Unlock()
+		// Already terminated
+		return false
+	default:
+	}
+	defer tx.mu.Unlock()
+
+	if tx.onTerminate != nil {
+		prev := tx.onTerminate
+		tx.onTerminate = func(key string, err error) {
+			prev(key, err)
+			f(key, err)
+		}
+		return true
+	}
 	tx.onTerminate = f
+	return true
 }
 
 // TODO
@@ -179,7 +237,9 @@ func (tx *baseTx) initFSM(fsmState fsmContextState) {
 func (tx *baseTx) spinFsmUnsafe(in fsmInput) {
 	for i := in; i != FsmInputNone; {
 		if TransactionFSMDebug {
-			tx.log.Debug().Str("state", fsmString(i)).Msg("Changing transaction state")
+			fname := runtime.FuncForPC(reflect.ValueOf(tx.fsmState).Pointer()).Name()
+			fname = fname[strings.LastIndex(fname, ".")+1:]
+			tx.log.Debug("Changing transaction state", "key", tx.key, "input", fsmString(i), "state", fname)
 		}
 		i = tx.fsmState(i)
 	}
@@ -188,12 +248,7 @@ func (tx *baseTx) spinFsmUnsafe(in fsmInput) {
 // Choose the right FSM init function depending on request method.
 func (tx *baseTx) spinFsm(in fsmInput) {
 	tx.fsmMu.Lock()
-	for i := in; i != FsmInputNone; {
-		if TransactionFSMDebug {
-			tx.log.Debug().Str("state", fsmString(i)).Msg("Changing transaction state")
-		}
-		i = tx.fsmState(i)
-	}
+	tx.spinFsmUnsafe(in)
 	tx.fsmMu.Unlock()
 }
 
@@ -231,22 +286,40 @@ func (tx *baseTx) Err() error {
 	return err
 }
 
-type FnTxTerminate func(key string)
+type FnTxTerminate func(key string, err error)
+type FnTxCancel func(r *Request)
+type FnTxResponse func(r *Response)
+
+func isRFC3261(branch string) bool {
+	return branch != "" &&
+		strings.HasPrefix(branch, RFC3261BranchMagicCookie) &&
+		strings.TrimPrefix(branch, RFC3261BranchMagicCookie) != ""
+}
+
+// ServerTxKeyMake creates server key for matching retransmitting requests - RFC 3261 17.2.3.
+func ServerTxKeyMake(msg Message) (string, error) {
+	return makeServerTxKey(msg, "")
+}
 
 // MakeServerTxKey creates server key for matching retransmitting requests - RFC 3261 17.2.3.
-func MakeServerTxKey(msg Message) (string, error) {
+// https://datatracker.ietf.org/doc/html/rfc3261#section-17.2.3
+func makeServerTxKey(msg Message, asMethod RequestMethod) (string, error) {
 	firstViaHop := msg.Via()
 	if firstViaHop == nil {
-		return "", fmt.Errorf("'Via' header not found or empty in message '%s'", MessageShortString(msg))
+		return "", fmt.Errorf("'Via' header not found or empty in message '%s'", messageShortString(msg))
 	}
 
 	cseq := msg.CSeq()
 	if cseq == nil {
-		return "", fmt.Errorf("'CSeq' header not found in message '%s'", MessageShortString(msg))
+		return "", fmt.Errorf("'CSeq' header not found in message '%s'", messageShortString(msg))
 	}
 	method := cseq.MethodName
-	if method == ACK || method == CANCEL {
+	if method == ACK {
 		method = INVITE
+	}
+
+	if asMethod != "" {
+		method = asMethod
 	}
 
 	var isRFC3261 bool
@@ -285,15 +358,15 @@ func MakeServerTxKey(msg Message) (string, error) {
 	// RFC 2543 compliant
 	from := msg.From()
 	if from == nil {
-		return "", fmt.Errorf("'From' header not found in message '%s'", MessageShortString(msg))
+		return "", fmt.Errorf("'From' header not found in message '%s'", messageShortString(msg))
 	}
 	fromTag, ok := from.Params.Get("tag")
 	if !ok {
-		return "", fmt.Errorf("'tag' param not found in 'From' header of message '%s'", MessageShortString(msg))
+		return "", fmt.Errorf("'tag' param not found in 'From' header of message '%s'", messageShortString(msg))
 	}
 	callId := msg.CallID()
 	if callId == nil {
-		return "", fmt.Errorf("'Call-ID' header not found in message '%s'", MessageShortString(msg))
+		return "", fmt.Errorf("'Call-ID' header not found in message '%s'", messageShortString(msg))
 	}
 
 	builder.WriteString(fromTag)
@@ -310,27 +383,35 @@ func MakeServerTxKey(msg Message) (string, error) {
 	return builder.String(), nil
 }
 
-// MakeClientTxKey creates client key for matching responses - RFC 3261 17.1.3.
-func MakeClientTxKey(msg Message) (string, error) {
+// ClientTxKeyMake creates client key for matching responses - RFC 3261 17.1.3.
+func ClientTxKeyMake(msg Message) (string, error) {
+	return makeClientTxKey(msg, "")
+}
+
+func makeClientTxKey(msg Message, asMethod RequestMethod) (string, error) {
 	cseq := msg.CSeq()
 	if cseq == nil {
-		return "", fmt.Errorf("'CSeq' header not found in message '%s'", MessageShortString(msg))
+		return "", fmt.Errorf("'CSeq' header not found in message '%s'", messageShortString(msg))
 	}
 	method := cseq.MethodName
-	if method == ACK || method == CANCEL {
+	if method == ACK {
 		method = INVITE
+	}
+
+	if asMethod != "" {
+		method = asMethod
 	}
 
 	firstViaHop := msg.Via()
 	if firstViaHop == nil {
-		return "", fmt.Errorf("'Via' header not found or empty in message '%s'", MessageShortString(msg))
+		return "", fmt.Errorf("'Via' header not found or empty in message '%s'", messageShortString(msg))
 	}
 
 	branch, ok := firstViaHop.Params.Get("branch")
 	if !ok || len(branch) == 0 ||
 		!strings.HasPrefix(branch, RFC3261BranchMagicCookie) ||
 		len(strings.TrimPrefix(branch, RFC3261BranchMagicCookie)) == 0 {
-		return "", fmt.Errorf("'branch' not found or empty in 'Via' header of message '%s'", MessageShortString(msg))
+		return "", fmt.Errorf("'branch' not found or empty in 'Via' header of message '%s'", messageShortString(msg))
 	}
 
 	var builder strings.Builder
@@ -341,42 +422,50 @@ func MakeClientTxKey(msg Message) (string, error) {
 	return builder.String(), nil
 }
 
-type transactionStore struct {
-	transactions map[string]Transaction
-	mu           sync.RWMutex
+type transactionStore[T Transaction] struct {
+	items map[string]T
+	mu    sync.RWMutex
 }
 
-func newTransactionStore() *transactionStore {
-	return &transactionStore{
-		transactions: make(map[string]Transaction),
+func newTransactionStore[T Transaction]() *transactionStore[T] {
+	return &transactionStore[T]{
+		items: make(map[string]T),
 	}
 }
 
-func (store *transactionStore) put(key string, tx Transaction) {
+func (store *transactionStore[T]) lock() {
 	store.mu.Lock()
-	defer store.mu.Unlock()
-	store.transactions[key] = tx
 }
 
-func (store *transactionStore) get(key string) (Transaction, bool) {
+func (store *transactionStore[T]) unlock() {
+	store.mu.Unlock()
+}
+
+func (store *transactionStore[T]) put(key string, tx T) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	store.items[key] = tx
+}
+
+func (store *transactionStore[T]) get(key string) (T, bool) {
 	store.mu.RLock()
 	defer store.mu.RUnlock()
-	tx, ok := store.transactions[key]
+	tx, ok := store.items[key]
 	return tx, ok
 }
 
-func (store *transactionStore) drop(key string) bool {
+func (store *transactionStore[T]) drop(key string) bool {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	_, exists := store.transactions[key]
-	delete(store.transactions, key)
+	_, exists := store.items[key]
+	delete(store.items, key)
 	return exists
 }
 
-func (store *transactionStore) terminateAll() {
+func (store *transactionStore[T]) terminateAll() {
 	store.mu.RLock()
 	defer store.mu.RUnlock()
-	for _, tx := range store.transactions {
+	for _, tx := range store.items {
 		store.mu.RUnlock()
 		tx.Terminate() // Calls on terminate to be deleted from store. It is deadlock if called inside loop
 		store.mu.RLock()
