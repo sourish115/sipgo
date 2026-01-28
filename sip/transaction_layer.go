@@ -88,7 +88,7 @@ func (txl *TransactionLayer) handleMessage(msg Message) {
 
 func (txl *TransactionLayer) handleRequestBackground(req *Request) {
 	if err := txl.handleRequest(req); err != nil {
-		txl.log.Error("Server tx failed to handle request", "error", err, "req", req.StartLine())
+		txl.log.Error("Server tx failed to handle request", "error", err, "req\n", req.String())
 	}
 }
 

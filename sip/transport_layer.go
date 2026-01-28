@@ -404,16 +404,16 @@ func (l *TransportLayer) ClientRequestConnection(ctx context.Context, req *Reque
 
 	// This is probably client forcing host:port
 	if req.Method == CANCEL && raddr.IP != nil && raddr.Port > 0 {
-		c, _ = transport.GetConnection(raddr.String())
+		c = transport.GetConnection(raddr.String())
 		if c != nil {
 			return c, nil
 		}
 	} else if laddr.IP != nil && laddr.Port > 0 {
-		c, _ = transport.GetConnection(laddr.String())
+		c = transport.GetConnection(laddr.String())
 		if c != nil {
 			return c, nil
 		}
-	} else if l.ConnectionReuse {
+	} else if l.connectionReuse {
 		viaHop.Params.Add("alias", "")
 		addr := raddr.String()
 		c = transport.GetConnection(addr)
@@ -468,7 +468,7 @@ func (l *TransportLayer) serverRequestConnection(ctx context.Context, req *Reque
 
 	// TODO: refactor bellow to remove duplicate code
 
-	viaHost, viaPort := req.sourceViaHostPort()
+	_, viaPort := req.sourceViaHostPort()
 	if sourceAddr != "" {
 		// https://datatracker.ietf.org/doc/html/rfc3263#section-5
 		// 		for unreliable transport protocols, to the source
@@ -520,7 +520,7 @@ func (l *TransportLayer) serverRequestConnection(ctx context.Context, req *Reque
 		// IP:       net.ParseIP(uriNetIP(viaHost)),
 	}
 
-	if err := l.resolveRemoteAddr(ctx, network, uriNetIP(viaHost), req.Recipient.Scheme, &raddr); err != nil {
+	if err := l.resolveRemoteAddr(ctx, network, sourceAddr, req.Recipient.Scheme, &raddr); err != nil {
 		return nil, err
 	}
 
