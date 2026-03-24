@@ -26,7 +26,7 @@ type DialogServerSession struct {
 // ReadAck changes dialog state to confiremed
 func (s *DialogServerSession) ReadAck(req *sip.Request, tx sip.ServerTransaction) error {
 	// cseq must match to our last dialog cseq
-	if req.CSeq().SeqNo != s.lastCSeqNo.Load() {
+	if req.CSeq().SeqNo != s.remoteCSeqNo.Load() {
 		return ErrDialogInvalidCseq
 	}
 	s.setState(sip.DialogStateConfirmed)
@@ -310,6 +310,11 @@ func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 	}
 
 	s.setState(sip.DialogStateEstablished)
+
+	// Register dialog state read channel before transmitting 200 OK. This prevents a race
+	// condition where the ACK is received before we start waiting for it.
+	readStateCh := s.StateRead()
+
 	if err := tx.Respond(res); err != nil {
 		return err
 	}
@@ -322,7 +327,6 @@ func (s *DialogServerSession) WriteResponse(res *sip.Response) error {
 	defer timer.Stop()
 
 	state := sip.DialogStateEstablished
-	readStateCh := s.StateRead()
 	for state == sip.DialogStateEstablished {
 		select {
 		case <-timer.C:
@@ -370,9 +374,9 @@ func (s *DialogServerSession) WriteBye(ctx context.Context, bye *sip.Request) er
 	// However, the callee's UA MUST NOT send a BYE on a confirmed dialog
 	// until it has received an ACK for its 2xx response or until the server
 	// transaction times out.
-	if sip.DialogState(state) != sip.DialogStateConfirmed {
-		return nil
-	}
+	// if sip.DialogState(state) != sip.DialogStateConfirmed {
+	// 	return nil
+	// }
 
 	res := s.Dialog.InviteResponse
 

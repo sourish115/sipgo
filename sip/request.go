@@ -288,6 +288,7 @@ func newAckRequestNon2xx(inviteRequest *Request, inviteResponse *Response, body 
 	ackRequest.SetBody(body)
 	ackRequest.SetTransport(inviteRequest.Transport())
 	ackRequest.SetSource(inviteRequest.Source())
+	ackRequest.Laddr = inviteRequest.Laddr
 	// if inviteResponse.IsSuccess() {
 	// 	// update branch, 2xx ACK is separate Tx
 	// 	viaHop := ackRequest.Via()

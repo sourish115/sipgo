@@ -27,6 +27,8 @@ type TransactionLayer struct {
 	clientTransactions *transactionStore[*ClientTx]
 	serverTransactions *transactionStore[*ServerTx]
 
+	terminateOnConnClose bool
+
 	log *slog.Logger
 }
 
@@ -43,6 +45,17 @@ func WithTransactionLayerLogger(l *slog.Logger) TransactionLayerOption {
 func WithTransactionLayerUnhandledResponseHandler(f func(r *Response)) TransactionLayerOption {
 	return func(txl *TransactionLayer) {
 		txl.unRespHandler = f
+	}
+}
+
+// WithTransactionLayerTerminateOnConnClose enables termination of pending
+// client and server transactions when the underlying connection closes,
+// instead of waiting for timers to expire.
+//
+// Experimental
+func WithTransactionLayerTerminateOnConnClose() TransactionLayerOption {
+	return func(txl *TransactionLayer) {
+		txl.terminateOnConnClose = true
 	}
 }
 
@@ -63,11 +76,57 @@ func NewTransactionLayer(tpl *TransportLayer, options ...TransactionLayerOption)
 
 	//Send all transport messages to our transaction layer
 	tpl.OnMessage(txl.handleMessage)
+
+	notify := func(conn Connection) { txl.OnConnectionClose(conn) }
+	if tpl.tcp != nil {
+		tpl.tcp.onConnClose = notify
+	}
+	if tpl.tls != nil {
+		tpl.tls.onConnClose = notify
+	}
+	if tpl.ws != nil {
+		tpl.ws.onConnClose = notify
+	}
+	if tpl.wss != nil {
+		tpl.wss.onConnClose = notify
+	}
+
 	return txl
 }
 
 func (txl *TransactionLayer) OnRequest(h TransactionRequestHandler) {
 	txl.reqHandler = h
+}
+
+// OnConnectionClose is called when a reliable transport connection (TCP, TLS,
+// WS, WSS) is closed by the remote side or due to a read error.
+func (txl *TransactionLayer) OnConnectionClose(conn Connection) {
+	if txl.terminateOnConnClose {
+		txl.terminateClientTransactions(conn)
+		txl.terminateServerTransactions(conn)
+	}
+}
+
+func (txl *TransactionLayer) terminateClientTransactions(conn Connection) {
+	txl.clientTransactions.mu.RLock()
+	for _, tx := range txl.clientTransactions.items {
+		if tx.conn == conn {
+			go tx.spinFsmWithError(client_input_transport_err,
+				fmt.Errorf("connection closed: %w", ErrTransactionTransport))
+		}
+	}
+	txl.clientTransactions.mu.RUnlock()
+}
+
+func (txl *TransactionLayer) terminateServerTransactions(conn Connection) {
+	txl.serverTransactions.mu.RLock()
+	for _, tx := range txl.serverTransactions.items {
+		if tx.conn == conn {
+			go tx.spinFsmWithError(server_input_transport_err,
+				fmt.Errorf("connection closed: %w", ErrTransactionTransport))
+		}
+	}
+	txl.serverTransactions.mu.RUnlock()
 }
 
 // handleMessage is entry for handling requests and responses from transport
