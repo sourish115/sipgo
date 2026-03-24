@@ -1,6 +1,9 @@
 package sip
 
-import "log/slog"
+import (
+	"log/slog"
+	"os"
+)
 
 var (
 	defLogger *slog.Logger
@@ -16,5 +19,7 @@ func DefaultLogger() *slog.Logger {
 	if defLogger != nil {
 		return defLogger
 	}
-	return slog.Default()
+	opts := &slog.HandlerOptions{Level: slog.LevelDebug}
+	defLogger = slog.New(slog.NewTextHandler(os.Stdout, opts))
+	return defLogger
 }
